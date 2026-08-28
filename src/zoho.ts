@@ -39,9 +39,6 @@ interface RequestOptions {
   method?: "GET" | "POST" | "DELETE";
   query?: Record<string, string | number | undefined>;
   form?: Record<string, string | number | undefined>;
-  /** Internal: prevents infinite auth-retry recursion. */
-  _retriedAuth?: boolean;
-  _rateLimitAttempt?: number;
 }
 
 /** Portal-scoped path, e.g. "tasks/" -> /restapi/portal/{id}/tasks/ */
@@ -54,67 +51,109 @@ function portalUrl(path: string, query?: RequestOptions["query"]): string {
   return url.toString();
 }
 
+/** No Zoho call may hang indefinitely; a stuck one would hold a slot forever. */
+const REQUEST_TIMEOUT_MS = Number(process.env.ZOHO_TIMEOUT_MS ?? 30_000);
+
+const MAX_RATE_LIMIT_RETRIES = 3;
+
+/**
+ * One Zoho request, with auth retry and rate-limit backoff.
+ *
+ * Retries happen INSIDE the single acquired slot. Recursing into the limiter
+ * for a retry deadlocks: the outer call still holds its slot while the inner
+ * one queues for a slot that will never free, so a burst of expired-token 401s
+ * equal to the concurrency limit wedges the process permanently.
+ */
 async function request<T = any>(path: string, opts: RequestOptions = {}): Promise<T> {
   const method = opts.method ?? "GET";
-  const url = path.startsWith("http") ? path : portalUrl(path, opts.query);
 
-  const run = async (): Promise<T> => {
-    const token = await getAccessToken();
-    const headers: Record<string, string> = {
-      Authorization: `Zoho-oauthtoken ${token}`,
-      Accept: "application/json",
-    };
+  return withSlot(async () => {
+    let retriedAuth = false;
+    let rateLimitAttempt = 0;
 
-    let body: string | undefined;
-    if (opts.form) {
-      const form = new URLSearchParams();
-      for (const [k, v] of Object.entries(opts.form)) {
-        if (v !== undefined && v !== "") form.set(k, String(v));
+    for (;;) {
+      // Built per attempt: the portal id is context-dependent.
+      const url = path.startsWith("http") ? path : portalUrl(path, opts.query);
+      const token = await getAccessToken();
+
+      const headers: Record<string, string> = {
+        Authorization: `Zoho-oauthtoken ${token}`,
+        Accept: "application/json",
+      };
+
+      let body: string | undefined;
+      if (opts.form) {
+        const form = new URLSearchParams();
+        for (const [k, v] of Object.entries(opts.form)) {
+          // `undefined` means "leave unchanged"; "" means "set to empty", so
+          // only the former is skipped.
+          if (v !== undefined) form.set(k, String(v));
+        }
+        body = form.toString();
+        headers["Content-Type"] = "application/x-www-form-urlencoded";
       }
-      body = form.toString();
-      headers["Content-Type"] = "application/x-www-form-urlencoded";
-    }
 
-    log.debug(`${method} ${url}`, opts.form ? { form: opts.form } : undefined);
-    const res = await fetch(url, { method, headers, body });
-    const text = await res.text();
+      log.debug(`${method} ${url}`, opts.form ? { form: opts.form } : undefined);
 
-    if (res.status === 401 && !opts._retriedAuth) {
-      log.warn("Zoho returned 401 — refreshing token and retrying once");
-      await invalidateAndRefresh();
-      return request<T>(path, { ...opts, _retriedAuth: true });
-    }
+      let res: Response;
+      try {
+        res = await fetch(url, {
+          method,
+          headers,
+          body,
+          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        });
+      } catch (err) {
+        const timedOut = err instanceof Error && err.name === "TimeoutError";
+        throw new ZohoError(
+          timedOut
+            ? `Zoho did not respond within ${REQUEST_TIMEOUT_MS / 1000}s.`
+            : `Could not reach Zoho: ${err instanceof Error ? err.message : String(err)}`,
+          undefined,
+          undefined,
+          timedOut ? "Try again; Zoho may be slow or the portal very large." : undefined,
+        );
+      }
 
-    if (res.status === 429) {
-      const attempt = opts._rateLimitAttempt ?? 0;
-      if (attempt < 3) {
+      const text = await res.text();
+
+      if (res.status === 401 && !retriedAuth) {
+        log.warn("Zoho returned 401 — refreshing token and retrying once");
+        retriedAuth = true;
+        await invalidateAndRefresh();
+        continue;
+      }
+
+      if (res.status === 429 && rateLimitAttempt < MAX_RATE_LIMIT_RETRIES) {
         const retryAfter = Number(res.headers.get("retry-after"));
         const waitMs =
           Number.isFinite(retryAfter) && retryAfter > 0
             ? retryAfter * 1000
-            : 2000 * 2 ** attempt;
-        log.warn(`rate limited by Zoho, waiting ${waitMs}ms (attempt ${attempt + 1}/3)`);
+            : 2000 * 2 ** rateLimitAttempt;
+        rateLimitAttempt++;
+        log.warn(
+          `rate limited by Zoho, waiting ${waitMs}ms ` +
+            `(attempt ${rateLimitAttempt}/${MAX_RATE_LIMIT_RETRIES})`,
+        );
         await sleep(waitMs);
-        return request<T>(path, { ...opts, _rateLimitAttempt: attempt + 1 });
+        continue;
+      }
+
+      if (!res.ok) throw describeZohoError(res.status, text);
+
+      if (!text.trim()) return {} as T;
+      try {
+        return JSON.parse(text) as T;
+      } catch {
+        throw new ZohoError(
+          `Zoho returned a response that was not JSON (HTTP ${res.status}).`,
+          res.status,
+          undefined,
+          text.slice(0, 200),
+        );
       }
     }
-
-    if (!res.ok) throw describeZohoError(res.status, text);
-
-    if (!text.trim()) return {} as T;
-    try {
-      return JSON.parse(text) as T;
-    } catch {
-      throw new ZohoError(
-        `Zoho returned a response that was not JSON (HTTP ${res.status}).`,
-        res.status,
-        undefined,
-        text.slice(0, 200),
-      );
-    }
-  };
-
-  return withSlot(run);
+  });
 }
 
 /* ------------------------------------------------------------------ *
@@ -192,10 +231,19 @@ export async function listProjects(activeOnly = true): Promise<Project[]> {
     }
     if (batch.length < range) break;
     index += range;
-    if (index > 2000) break; // safety valve
+    if (index > PROJECT_PAGE_LIMIT) {
+      log.warn(
+        `project list truncated at ${out.length}; this account can see more. ` +
+          `Anything derived from it is a partial view.`,
+      );
+      break;
+    }
   }
   return out;
 }
+
+/** Hard stop on project paging. 10 pages of 200. */
+const PROJECT_PAGE_LIMIT = 2000;
 
 /* ------------------------------------------------------------------ *
  * Tasks — portal-wide endpoint: one call per page, not one per project
@@ -562,6 +610,10 @@ export async function createTask(input: CreateTaskInput): Promise<Task> {
     name: String(o.full_name ?? o.name ?? ""),
   }));
 
+  // A task created by this user is owned by them, so the owner record
+  // carries the portal user id we may not otherwise be able to read.
+  if (owners.length === 1) noteOwnerIdFromWrite(owners[0].portalUserId);
+
   return {
     task_id: String(raw?.id_string ?? raw?.id ?? ""),
     task_name: String(raw?.name ?? input.name),
@@ -661,7 +713,11 @@ export async function createTimeLog(input: CreateLogInput): Promise<TimeLog> {
   );
 
   const raw = json.timelogs?.tasklogs?.[0] ?? json.tasklogs?.[0] ?? json;
-  return normaliseLog(raw, dateFormat, input.isoDate);
+  const created = normaliseLog(raw, dateFormat, input.isoDate);
+  // Zoho stamps the entry with the caller's portal user id — for a user who
+  // owns no tasks this is the only place it can be discovered.
+  noteOwnerIdFromWrite(created.owner_id);
+  return created;
 }
 
 export interface UpdateLogInput {
@@ -782,6 +838,29 @@ export async function listTimeLogs(query: LogQuery): Promise<TimeLog[]> {
  * treat "cannot tell" as "not mine" rather than falling through to showing or
  * mutating everyone's entries.
  */
+/**
+ * The caller's own portal user id, learned from a Zoho write response.
+ *
+ * For a non-admin who owns no tasks there is no readable endpoint that maps
+ * their zpuid to the 600-space id timelogs use. But Zoho stamps that id on
+ * anything they create, so the first write reveals it. Set by createTimeLog
+ * and createTask; drained by the HTTP layer, which persists it.
+ */
+let discoveredOwnerId: string | null = null;
+
+export function takeDiscoveredOwnerId(): string | null {
+  const found = discoveredOwnerId;
+  discoveredOwnerId = null;
+  return found;
+}
+
+function noteOwnerIdFromWrite(ownerId: string | undefined): void {
+  if (!ownerId) return;
+  if (effective().timelogOwnerId) return; // already known
+  discoveredOwnerId = ownerId;
+  log.info(`learned portal user id ${ownerId} from a write response`);
+}
+
 export function isOwnLog(log: TimeLog): boolean {
   const owner = effective().timelogOwnerId;
   return Boolean(owner) && log.owner_id === owner;

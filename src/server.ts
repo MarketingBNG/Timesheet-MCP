@@ -125,7 +125,7 @@ export function createServer(): McpServer {
     {
       title: "List Zoho projects",
       description:
-        "List the projects visible to the configured Zoho account. Cheap; use this to " +
+        "List the projects visible to the signed-in Zoho account. Cheap; use this to " +
         "narrow get_my_tasks with project_name when the portal has many tasks.",
       inputSchema: {
         include_inactive: z
@@ -148,7 +148,7 @@ export function createServer(): McpServer {
     {
       title: "Get my Zoho tasks",
       description:
-        "List tasks assigned to the configured Zoho user across all projects in the " +
+        "List tasks assigned to the signed-in Zoho user across all projects in the " +
         "portal, so a spoken task name can be resolved to a real task_id before logging time.",
       inputSchema: {
         project_name: z
@@ -188,8 +188,8 @@ export function createServer(): McpServer {
             : who
               ? `No open tasks are assigned to ${who.email || who.name} in Zoho. Ask for tasks ` +
                 `to be assigned, create one with create_task, or pass include_others:true.`
-              : "No open tasks are assigned to this user. Try include_others:true, or check that " +
-                "ZOHO_USER_ID is the right Zoho user id.";
+              : "No open tasks are assigned to this user. Try include_others:true, or check " +
+                "that the account this server is configured with is the right one.";
           return ok(hint, []);
         }
 
@@ -276,7 +276,8 @@ export function createServer(): McpServer {
           if (!task) {
             audit({ outcome: "refused_no_match", requested });
             return fail(
-              `No task with id ${task_id} is visible to this account in portal ${config.portalId}.`,
+              `Could not find task ${task_id}. If it is not assigned to you, pass project_id ` +
+                `as well so it can be looked up directly.`,
             );
           }
         } else {
@@ -284,8 +285,8 @@ export function createServer(): McpServer {
           if (pool.length === 0) {
             audit({ outcome: "refused_no_match", requested });
             return fail(
-              "There are no open tasks assigned to this user to match against. Run get_my_tasks " +
-                "to check the ZOHO_USER_ID configuration.",
+              "You have no open tasks to match a name against. Create one with create_task, " +
+                "or ask for a task to be assigned to you in Zoho.",
             );
           }
 

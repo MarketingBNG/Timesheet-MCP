@@ -331,11 +331,23 @@ export function oauthRouter(): Router {
   router.post("/token", async (req, res) => {
     const grantType = String(req.body?.grant_type ?? "");
 
+    // Public clients send no secret, so client_id is all we can bind to --
+    // but a grant must still only be redeemable by the client it was issued
+    // to, otherwise any registered client that obtains one can use it.
+    const presentedClientId = String(req.body?.client_id ?? "");
+
     if (grantType === "refresh_token") {
       const presented = String(req.body?.refresh_token ?? "");
       const stored = await getToken(presented);
       if (!stored || stored.kind !== "refresh") {
         res.status(400).json({ error: "invalid_grant" });
+        return;
+      }
+      if (presentedClientId && presentedClientId !== stored.clientId) {
+        res.status(400).json({
+          error: "invalid_grant",
+          error_description: "This refresh token was issued to a different client.",
+        });
         return;
       }
       res.json(await issueAccessToken(stored.zpuid, stored.clientId, presented));
@@ -359,6 +371,13 @@ export function oauthRouter(): Router {
       return;
     }
 
+    if (presentedClientId && presentedClientId !== record.clientId) {
+      res.status(400).json({
+        error: "invalid_grant",
+        error_description: "This code was issued to a different client.",
+      });
+      return;
+    }
     if (String(req.body?.redirect_uri ?? "") !== record.redirectUri) {
       res.status(400).json({ error: "invalid_grant", error_description: "redirect_uri mismatch." });
       return;

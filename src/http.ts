@@ -17,7 +17,7 @@ import {
   pruneExpiredTokens,
   updateUserDetails,
 } from "./store.js";
-import { getPortalMeta, resolveIdentityFromTasks } from "./zoho.js";
+import { getPortalMeta, resolveIdentityFromTasks, takeDiscoveredOwnerId } from "./zoho.js";
 import { getAccessToken } from "./auth.js";
 
 /**
@@ -222,6 +222,17 @@ app.post("/mcp", async (req: Request, res: Response) => {
 
   try {
     await (who ? runWithUser(who, handle) : handle());
+
+    // A write may have revealed the caller's portal user id. Persist it so
+    // the next request can filter their timesheet to just them.
+    if (who && !who.portalUserId) {
+      const discovered = takeDiscoveredOwnerId();
+      if (discovered) {
+        await updateUserDetails(who.zpuid, { portalUserId: discovered });
+        resolveAttempts.delete(who.zpuid);
+        log.info(`persisted portal user id ${discovered} for ${who.email || who.zpuid}`);
+      }
+    }
   } catch (err) {
     log.error("request failed", err instanceof Error ? err.stack : String(err));
     if (!res.headersSent) {
