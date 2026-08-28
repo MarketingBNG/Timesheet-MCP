@@ -25,6 +25,8 @@ import {
   createTimeLog,
   updateTimeLog,
   fetchTaskLogs,
+  callerIsIdentified,
+  isOwnLog,
   deleteTimeLog,
   getPortalMeta,
   getTaskById,
@@ -354,7 +356,11 @@ export function createServer(): McpServer {
           // every task the caller owns -- dozens of requests to answer a
           // question about one of them, which trips Zoho's throttle.
           const existing = await fetchTaskLogs(task);
-          const clash = existing.filter((l) => l.date === date);
+          // Only the caller's own entries count as a duplicate. Tasks are
+          // shared, so a colleague's time on the same day is not a clash.
+          const clash = existing.filter(
+            (l) => l.date === date && (callerIsIdentified() ? isOwnLog(l) : true),
+          );
           if (clash.length > 0) {
             audit({ outcome: "refused_duplicate", requested, resolved });
             return fail(
@@ -402,6 +408,52 @@ export function createServer(): McpServer {
 
   /* -------------------------- get_timesheet_status ------------------------ */
 
+  /**
+   * Refuse to mutate a timesheet entry that belongs to someone else.
+   *
+   * Tasks are shared and get_timesheet_status hands out log ids, so without
+   * this one user can delete or rewrite another's time. Returns a refusal to
+   * send back, or null when the caller owns the entry.
+   */
+  async function refuseIfNotOwn(
+    logId: string,
+    taskId: string,
+    projectId: string,
+    verb: string,
+  ): Promise<ToolResult | null> {
+    if (!callerIsIdentified()) {
+      return fail(
+        `Cannot tell which Zoho user you are, so this entry cannot be confirmed as yours ` +
+          `and will not be ${verb === "delete" ? "deleted" : "edited"}. This resolves once ` +
+          `you own at least one task in Zoho.`,
+      );
+    }
+
+    const task = await getTaskById(taskId, projectId);
+    if (!task) {
+      return fail(`Could not find task ${taskId} in project ${projectId}.`);
+    }
+
+    const entry = (await fetchTaskLogs(task)).find((l) => l.log_id === String(logId));
+    if (!entry) {
+      return fail(`No timesheet entry ${logId} exists on that task.`);
+    }
+
+    if (!isOwnLog(entry)) {
+      audit({
+        outcome: "refused_not_owner",
+        requested: { action: `${verb}_time_log`, log_id: logId, task_id: taskId },
+        resolved: { owner_name: entry.owner_name },
+      });
+      return fail(
+        `That entry belongs to ${entry.owner_name || "another user"}, not you. ` +
+          `You can only ${verb} your own timesheet entries.`,
+      );
+    }
+
+    return null;
+  }
+
   function logView(l: TimeLog) {
     return {
       log_id: l.log_id,
@@ -421,9 +473,9 @@ export function createServer(): McpServer {
     {
       title: "Get timesheet status",
       description:
-        "Total hours logged per day over a date range for the configured user, so questions " +
+        "Total hours logged per day over a date range for the signed-in user, so questions " +
         "like 'did I log yesterday?' can be answered. Days with nothing logged are reported " +
-        "explicitly as zero.",
+        "explicitly as zero. Only that user's own entries are counted.",
       inputSchema: {
         date_from: z.string().describe("Start of the range, inclusive, YYYY-MM-DD."),
         date_to: z.string().describe("End of the range, inclusive, YYYY-MM-DD."),
@@ -436,6 +488,23 @@ export function createServer(): McpServer {
     async ({ date_from, date_to, include_entries }) =>
       guarded(async () => {
         const days = dateRange(date_from, date_to);
+
+        // Without a portal user id every log on the scanned tasks would be
+        // returned, including colleagues' — and summed as if it were the
+        // caller's. Reporting someone else's hours as yours is worse than
+        // reporting nothing, so decline instead.
+        if (!callerIsIdentified()) {
+          const who = currentUser();
+          return fail(
+            `Cannot tell which Zoho user you are, so your timesheet cannot be separated ` +
+              `from everyone else's — nothing is being reported rather than risk showing ` +
+              `you someone else's hours.\n\n` +
+              `This resolves automatically once you own at least one task in Zoho` +
+              (who?.email ? ` (checked for ${who.email})` : "") +
+              `. Use create_task, or ask for a task to be assigned to you.`,
+          );
+        }
+
         const logs = await listTimeLogs({ fromIso: date_from, toIso: date_to });
 
         const totals = new Map<string, number>(days.map((d) => [d, 0]));
@@ -484,6 +553,9 @@ export function createServer(): McpServer {
     },
     async ({ log_id, task_id, project_id }) =>
       guarded(async () => {
+        const refusal = await refuseIfNotOwn(log_id, task_id, project_id, "delete");
+        if (refusal) return refusal;
+
         try {
           await deleteTimeLog(project_id, task_id, log_id);
         } catch (err) {
@@ -612,13 +684,23 @@ export function createServer(): McpServer {
         });
 
         audit({
-          outcome: "created",
+          outcome: "updated",
           requested: { action: "update_task", task_id, project_id, status, name, priority },
           resolved: { task_id: task.task_id, task_name: task.task_name, status: task.status },
         });
 
+        // Zoho silently ignores a status name its workflow does not define,
+        // so report what actually stuck rather than what was asked for.
+        const stored = task.status || "(not reported)";
+        const mismatch =
+          status && task.status && task.status.toLowerCase() !== status.toLowerCase();
+
         return ok(
-          `Updated "${task.task_name}" [${task.task_id}]. Status is now ${task.status || "unchanged"}.`,
+          `Updated "${task.task_name}" [${task.task_id}]. Status is now ${stored}.` +
+            (mismatch
+              ? `\n\nNote: you asked for "${status}" but Zoho stored "${task.status}" — ` +
+                `that status name is probably not in this project's workflow.`
+              : ""),
           taskView(task),
         );
       }),
@@ -652,6 +734,9 @@ export function createServer(): McpServer {
           return fail("Nothing to change — pass at least one of hours, date, notes or bill_status.");
         }
 
+        const refusal = await refuseIfNotOwn(log_id, task_id, project_id, "edit");
+        if (refusal) return refusal;
+
         const hoursHHMM = hours === undefined ? undefined : hoursToHHMM(hours);
 
         try {
@@ -666,7 +751,7 @@ export function createServer(): McpServer {
           });
 
           audit({
-            outcome: "created",
+            outcome: "updated",
             requested: { action: "update_time_log", log_id, task_id, hours, date, notes },
             resolved: { log_id, hours_hhmm: hoursHHMM, date },
           });
@@ -750,7 +835,10 @@ export function createServer(): McpServer {
 
             if (skip_duplicates) {
               const existing = await fetchTaskLogs(task);
-              if (existing.some((l) => l.date === entry.date)) {
+              const alreadyMine = existing.some(
+                (l) => l.date === entry.date && (callerIsIdentified() ? isOwnLog(l) : true),
+              );
+              if (alreadyMine) {
                 results.push({
                   ...entry,
                   task_name: task.task_name,

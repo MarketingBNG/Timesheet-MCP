@@ -460,13 +460,15 @@ export async function resolveIdentityFromTasks(): Promise<TaskOwner | null> {
   // task has several owners.
   let common: TaskOwner[] | null = null;
   for (const task of tasks) {
-    if (task.owners.length === 0) continue;
+    // Owners with no portal user id are useless here, and worse: they all
+    // compare equal on "" and would survive the intersection together.
+    const owners = task.owners.filter((o) => o.portalUserId);
+    if (owners.length === 0) continue;
+
     if (common === null) {
-      common = [...task.owners];
+      common = [...owners];
     } else {
-      common = common.filter((c) =>
-        task.owners.some((o) => o.portalUserId === c.portalUserId),
-      );
+      common = common.filter((c) => owners.some((o) => o.portalUserId === c.portalUserId));
     }
     if (common.length === 1) break;
   }
@@ -771,6 +773,23 @@ export async function listTimeLogs(query: LogQuery): Promise<TimeLog[]> {
     .flat()
     .filter((l) => l.date >= query.fromIso && l.date <= query.toIso)
     .filter((l) => !ownerFilter || ownerFilter === "all" || l.owner_id === ownerFilter);
+}
+
+/**
+ * Whether a timelog belongs to the current caller.
+ *
+ * Returns false when the caller's portal user id is unknown: callers must
+ * treat "cannot tell" as "not mine" rather than falling through to showing or
+ * mutating everyone's entries.
+ */
+export function isOwnLog(log: TimeLog): boolean {
+  const owner = effective().timelogOwnerId;
+  return Boolean(owner) && log.owner_id === owner;
+}
+
+/** True when we know which Zoho user the current caller is. */
+export function callerIsIdentified(): boolean {
+  return Boolean(effective().timelogOwnerId);
 }
 
 /** Max tasks whose logs are read for one timesheet query. */

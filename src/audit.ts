@@ -11,7 +11,9 @@ import { log } from "./logger.js";
 
 export type AuditOutcome =
   | "created"
+  | "updated"
   | "deleted"
+  | "refused_not_owner"
   | "refused_ambiguous"
   | "refused_no_match"
   | "refused_duplicate"
