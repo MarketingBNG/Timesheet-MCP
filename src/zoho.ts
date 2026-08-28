@@ -234,14 +234,19 @@ interface TaskCache {
  */
 const taskCaches = new Map<string, TaskCache>();
 
-function taskCacheKey(mineOnly: boolean): string {
+function taskCacheKey(mineOnly: boolean, projectName = ""): string {
   const { portalId, userId, timelogOwnerId } = effective();
-  return `${portalId}:${userId}:${timelogOwnerId}:${mineOnly ? "mine" : "all"}`;
+  const scope = mineOnly ? "mine" : `all:${projectName.trim().toLowerCase()}`;
+  return `${portalId}:${userId}:${timelogOwnerId}:${scope}`;
 }
 
 export function clearTaskCache(): void {
-  taskCaches.delete(taskCacheKey(true));
-  taskCaches.delete(taskCacheKey(false));
+  // The "all" variant is keyed by project name too, so clear every entry
+  // belonging to this user rather than guessing the names.
+  const prefix = taskCacheKey(true).replace(/:mine$/, "");
+  for (const key of [...taskCaches.keys()]) {
+    if (key.startsWith(prefix)) taskCaches.delete(key);
+  }
 }
 
 export interface TaskQuery {
@@ -300,17 +305,39 @@ async function fetchMyTasks(): Promise<Task[]> {
  * Every task the account can see, gathered per project. Expensive and capped;
  * only used when explicitly asking for other people's tasks.
  */
-async function fetchAllTasks(): Promise<Task[]> {
-  const projects = await listProjects(true);
+async function fetchAllTasks(projectName?: string): Promise<Task[]> {
+  const all = await listProjects(true);
 
-  if (projects.length > PROJECT_SWEEP_CAP) {
-    log.warn(
-      `account can see ${projects.length} projects; only sweeping the first ` +
-        `${PROJECT_SWEEP_CAP} for tasks. Use project_name to target the rest.`,
+  // Narrow BEFORE capping: sweeping 20 arbitrary projects out of thousands
+  // returns a misleading subset that looks like a complete answer.
+  const needle = projectName?.trim().toLowerCase();
+  const matching = needle
+    ? all.filter((p) => p.project_name.toLowerCase().includes(needle))
+    : all;
+
+  if (needle && matching.length === 0) {
+    throw new ZohoError(
+      `No project matching "${projectName}" is visible to this account.`,
+      undefined,
+      undefined,
+      "Run list_projects to see the exact names.",
     );
   }
 
-  const targets = projects.slice(0, PROJECT_SWEEP_CAP);
+  if (matching.length > PROJECT_SWEEP_CAP) {
+    throw new ZohoError(
+      `${matching.length} projects match, which is too many to scan for tasks.`,
+      undefined,
+      undefined,
+      needle
+        ? "Narrow project_name further — it must match at most " +
+          `${PROJECT_SWEEP_CAP} projects.`
+        : "Listing other people's tasks across a portal this large is not supported. " +
+          "Pass project_name to scope it, or drop include_others to see your own tasks.",
+    );
+  }
+
+  const targets = matching;
   try {
     const batches = await Promise.all(
       targets.map((p) => fetchProjectTasks(p.project_id, p.project_name)),
@@ -389,7 +416,7 @@ export async function getTasks(query: TaskQuery = {}): Promise<Task[]> {
   const { mineOnly = true, openOnly = true, projectName, forceRefresh = false } = query;
 
   const { portalId, userId, label } = effective();
-  const cacheKey = taskCacheKey(mineOnly);
+  const cacheKey = taskCacheKey(mineOnly, projectName);
   const cached = taskCaches.get(cacheKey);
   const fresh =
     cached !== undefined &&
@@ -398,7 +425,7 @@ export async function getTasks(query: TaskQuery = {}): Promise<Task[]> {
   if (!fresh || forceRefresh) {
     // One request when we only need the caller's own tasks; a capped sweep
     // only when explicitly asked for everyone's.
-    const fetched = mineOnly ? await fetchMyTasks() : await fetchAllTasks();
+    const fetched = mineOnly ? await fetchMyTasks() : await fetchAllTasks(projectName);
     taskCaches.set(cacheKey, { fetchedAt: Date.now(), tasks: fetched });
     log.info(`fetched ${fetched.length} tasks for ${label}`);
   }
@@ -658,7 +685,7 @@ export async function listTimeLogs(query: LogQuery): Promise<TimeLog[]> {
 const TASK_LOG_SCAN_CAP = Number(process.env.TASK_LOG_SCAN_CAP ?? 40);
 
 /** Every timelog on one task. Cheap, and scoped to work the caller owns. */
-async function fetchTaskLogs(task: Task): Promise<TimeLog[]> {
+export async function fetchTaskLogs(task: Task): Promise<TimeLog[]> {
   const json = await request<any>(
     `projects/${task.project_id}/tasks/${task.task_id}/logs/`,
     { query: { index: 1, range: 200 } },

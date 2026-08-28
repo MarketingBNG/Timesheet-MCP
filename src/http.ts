@@ -119,13 +119,25 @@ async function authenticate(req: Request, res: Response): Promise<UserContext | 
 }
 
 /**
- * Users who connected before ZohoProjects.users.READ was in the scope list
+ * How long to wait before retrying a resolution that failed. Without this the
+ * lookup runs on every single request for a user who cannot be resolved --
+ * usually because they own no tasks -- costing two Zoho calls each time.
+ */
+const RESOLVE_RETRY_MS = 30 * 60 * 1000;
+const resolveAttempts = new Map<string, number>();
+
+/**
+ * Users who own no tasks, or who connected before the users scope was added,
  * have no portal user id, so their timesheet cannot be filtered to just them.
- * Fill it in on first use rather than making them reconnect. Best effort — a
+ * Fill it in on first use rather than making them reconnect. Best effort -- a
  * failure here must never block the request.
  */
 async function backfillPortalUserId(ctx: UserContext): Promise<UserContext> {
   if (ctx.portalUserId) return ctx;
+
+  const lastTried = resolveAttempts.get(ctx.zpuid) ?? 0;
+  if (Date.now() - lastTried < RESOLVE_RETRY_MS) return ctx;
+  resolveAttempts.set(ctx.zpuid, Date.now());
 
   try {
     // Preferred: the portal user list. Admin-only — returns 6401 for a
@@ -145,11 +157,14 @@ async function backfillPortalUserId(ctx: UserContext): Promise<UserContext> {
 
     if (!found?.portalUserId) {
       log.warn(
-        `could not resolve a portal user id for ${ctx.zpuid} — timesheet reads will not ` +
-          `be filtered to this user until they own at least one task`,
+        `could not resolve a portal user id for ${ctx.zpuid} — they own no tasks. ` +
+          `Timesheet reads stay unfiltered for them; retrying in 30 minutes.`,
       );
       return ctx;
     }
+
+    // Resolved: allow an immediate retry if it is ever cleared again.
+    resolveAttempts.delete(ctx.zpuid);
 
     await updateUserDetails(ctx.zpuid, {
       portalUserId: found.portalUserId,

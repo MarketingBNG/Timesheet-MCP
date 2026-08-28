@@ -22,6 +22,7 @@ import {
 
   createTask,
   createTimeLog,
+  fetchTaskLogs,
   deleteTimeLog,
   getPortalMeta,
   getTaskById,
@@ -339,8 +340,11 @@ export function createServer(): McpServer {
 
         // --- duplicate guard --------------------------------------------------
         if (!confirm_duplicate) {
-          const existing = await listTimeLogs({ fromIso: date, toIso: date });
-          const clash = existing.filter((l) => l.task_id === task!.task_id);
+          // Read only THIS task's logs. Going through listTimeLogs would scan
+          // every task the caller owns -- dozens of requests to answer a
+          // question about one of them, which trips Zoho's throttle.
+          const existing = await fetchTaskLogs(task);
+          const clash = existing.filter((l) => l.date === date);
           if (clash.length > 0) {
             audit({ outcome: "refused_duplicate", requested, resolved });
             return fail(
