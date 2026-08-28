@@ -91,9 +91,18 @@ export async function lookupPortalUser(
     }
 
     const users: any[] = json.users ?? [];
-    const match = users.find((u) => String(u.zpuid ?? "") === String(zpuid));
+    // The id field names vary between portals, so try each known spelling
+    // before giving up.
+    const match = users.find((u) =>
+      [u.zpuid, u.id, u.user_id, u.zuid].some((v) => String(v ?? "") === String(zpuid)),
+    );
+
     if (!match) {
-      log.warn(`zpuid ${zpuid} not found in the portal user list`);
+      // Log the shape, never the contents — this is other people's data.
+      log.warn(
+        `zpuid ${zpuid} not in the portal user list (${users.length} entries; ` +
+          `fields: ${users[0] ? Object.keys(users[0]).join(",") : "none"})`,
+      );
       return null;
     }
 

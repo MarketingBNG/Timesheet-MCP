@@ -30,8 +30,9 @@ export function describeZohoError(status: number, body: string): ZohoError {
   try {
     const json = JSON.parse(body);
     const err = json.error ?? json;
-    code = err.code ?? err.error_code;
-    message = err.message ?? err.error_message ?? json.message;
+    code = err.code ?? err.error_code ?? err.title;
+    // Newer Zoho errors nest the human-readable text under details.
+    message = err.message ?? err.details?.message ?? err.error_message ?? json.message;
   } catch {
     /* non-JSON body; fall through to the raw text */
   }
@@ -47,6 +48,12 @@ export function describeZohoError(status: number, body: string): ZohoError {
   };
 
   let hint = code !== undefined ? hints[String(code)] : undefined;
+
+  if (!hint && /THROTTLE/i.test(String(code))) {
+    hint =
+      "Zoho's rolling per-endpoint limit (100 requests / 2 minutes) was hit. " +
+      "Avoid include_others on large portals; it scans one project at a time.";
+  }
 
   if (!hint) {
     if (status === 401) {

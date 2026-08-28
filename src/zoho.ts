@@ -231,7 +231,9 @@ interface TaskCache {
 const taskCaches = new Map<string, TaskCache>();
 
 export function clearTaskCache(): void {
-  taskCaches.delete(effective().portalId);
+  const portalId = effective().portalId;
+  taskCaches.delete(`${portalId}:mine`);
+  taskCaches.delete(`${portalId}:all`);
 }
 
 export interface TaskQuery {
@@ -245,14 +247,50 @@ export interface TaskQuery {
   forceRefresh?: boolean;
 }
 
-/** Max projects swept for tasks, so a large portal cannot melt the rate limit. */
-const PROJECT_SWEEP_CAP = 60;
+/**
+ * Max projects swept for tasks. Only used for the include_others path -- the
+ * default path uses /mytasks/, which is a single call. Kept small because
+ * Zoho throttles at 100 requests per endpoint per 2 minutes, and portals can
+ * expose tens of thousands of projects.
+ */
+const PROJECT_SWEEP_CAP = Number(process.env.PROJECT_SWEEP_CAP ?? 20);
+
+/** Thrown to abort a sweep the moment Zoho starts throttling. */
+class ThrottledError extends Error {}
+
+function isThrottle(err: unknown): boolean {
+  const text = err instanceof Error ? err.message : String(err);
+  return /THROTTLE|more than \d+ requests/i.test(text);
+}
 
 /**
- * The portal-wide /tasks/ endpoint rejects requests with "Input Parameter
- * Missing" (6831) on at least some portals, so tasks are gathered per project
- * across the projects this account can actually see. That set is normally
- * small — it is the account's project membership, not the whole portal.
+ * Tasks assigned to the caller, in ONE request.
+ *
+ * This endpoint is what makes the server usable on a large portal. The
+ * per-project sweep below issues one request per project, which on a portal
+ * exposing tens of thousands of projects trips Zoho's rolling throttle (100
+ * requests per endpoint per 2 minutes) and locks the account out for half an
+ * hour. Returns 204 with an empty body when the user has no tasks.
+ */
+async function fetchMyTasks(): Promise<Task[]> {
+  const out: Task[] = [];
+  let index = 1;
+  const range = 200;
+
+  for (;;) {
+    const json = await request<any>("mytasks/", { query: { index, range } });
+    const batch: any[] = json.tasks ?? [];
+    for (const t of batch) out.push(toTask(t, ""));
+    if (batch.length < range) break;
+    index += range;
+    if (index > 2000) break;
+  }
+  return out;
+}
+
+/**
+ * Every task the account can see, gathered per project. Expensive and capped;
+ * only used when explicitly asking for other people's tasks.
  */
 async function fetchAllTasks(): Promise<Task[]> {
   const projects = await listProjects(true);
@@ -265,10 +303,52 @@ async function fetchAllTasks(): Promise<Task[]> {
   }
 
   const targets = projects.slice(0, PROJECT_SWEEP_CAP);
-  const batches = await Promise.all(
-    targets.map((p) => fetchProjectTasks(p.project_id, p.project_name)),
-  );
-  return batches.flat();
+  try {
+    const batches = await Promise.all(
+      targets.map((p) => fetchProjectTasks(p.project_id, p.project_name)),
+    );
+    return batches.flat();
+  } catch (err) {
+    if (err instanceof ThrottledError) {
+      throw new ZohoError(
+        "Zoho throttled the request while scanning projects for tasks.",
+        429,
+        undefined,
+        "This portal exposes too many projects to scan. Use get_my_tasks without " +
+          "include_others, or narrow it with project_name.",
+      );
+    }
+    throw err;
+  }
+}
+
+/** Map one Zoho task row onto our shape. */
+function toTask(t: any, projectName: string, projectId = ""): Task {
+  const owners: any[] = t.details?.owners ?? t.owners ?? [];
+  const statusName = String(t.status?.name ?? t.status ?? "");
+
+  return {
+    task_id: String(t.id_string ?? t.id),
+    task_name: String(t.name ?? ""),
+    project_id: String(t.project?.id_string ?? t.project?.id ?? projectId),
+    project_name: String(t.project?.name || projectName),
+    status: statusName,
+    completed:
+      t.completed === true ||
+      String(t.status?.type ?? "").toLowerCase() === "closed" ||
+      /^(closed|completed|done)$/i.test(statusName),
+    owner_ids: owners
+      .flatMap((o) => [o.zpuid, o.id, o.owner_id])
+      .map((v) => String(v ?? ""))
+      .filter(Boolean),
+    owners: owners.map((o) => ({
+      zpuid: String(o.zpuid ?? ""),
+      portalUserId: String(o.id ?? o.owner_id ?? ""),
+      email: String(o.email ?? ""),
+      name: String(o.full_name ?? o.name ?? ""),
+    })),
+    last_updated: t.last_updated_time ?? t.created_time,
+  };
 }
 
 async function fetchProjectTasks(projectId: string, projectName: string): Promise<Task[]> {
@@ -281,39 +361,15 @@ async function fetchProjectTasks(projectId: string, projectName: string): Promis
     try {
       json = await request<any>(`projects/${projectId}/tasks/`, { query: { index, range } });
     } catch (err) {
+      // A throttle affects every subsequent call, so stop the whole sweep
+      // rather than burning the remaining quota one project at a time.
+      if (isThrottle(err)) throw new ThrottledError(String(err));
       // One inaccessible project must not sink the whole task list.
       log.warn(`skipping tasks for project ${projectId}`, String(err));
       break;
     }
     const batch: any[] = json.tasks ?? [];
-    for (const t of batch) {
-      const owners: any[] = t.details?.owners ?? t.owners ?? [];
-      const statusName = String(t.status?.name ?? t.status ?? "");
-      out.push({
-        task_id: String(t.id_string ?? t.id),
-        task_name: String(t.name ?? ""),
-        project_id: String(t.project?.id_string ?? t.project?.id ?? projectId),
-        project_name: String(t.project?.name || projectName),
-        status: statusName,
-        completed:
-          t.completed === true ||
-          String(t.status?.type ?? "").toLowerCase() === "closed" ||
-          /^(closed|completed|done)$/i.test(statusName),
-        // Owners carry two ids in different spaces: zpuid (283967...) and the
-        // portal user id (600...). Keep both so a match on either works.
-        owner_ids: owners
-          .flatMap((o) => [o.zpuid, o.id, o.owner_id])
-          .map((v) => String(v ?? ""))
-          .filter(Boolean),
-        owners: owners.map((o) => ({
-          zpuid: String(o.zpuid ?? ""),
-          portalUserId: String(o.id ?? o.owner_id ?? ""),
-          email: String(o.email ?? ""),
-          name: String(o.full_name ?? o.name ?? ""),
-        })),
-        last_updated: t.last_updated_time ?? t.created_time,
-      });
-    }
+    for (const t of batch) out.push(toTask(t, projectName, projectId));
     if (batch.length < range) break;
     index += range;
     if (index > 2000) break; // safety valve
@@ -325,19 +381,25 @@ export async function getTasks(query: TaskQuery = {}): Promise<Task[]> {
   const { mineOnly = true, openOnly = true, projectName, forceRefresh = false } = query;
 
   const { portalId, userId, label } = effective();
-  const cached = taskCaches.get(portalId);
+  const cacheKey = `${portalId}:${mineOnly ? "mine" : "all"}`;
+  const cached = taskCaches.get(cacheKey);
   const fresh =
     cached !== undefined &&
     Date.now() - cached.fetchedAt < config.taskCacheTtlSeconds * 1000;
 
   if (!fresh || forceRefresh) {
-    const fetched = await fetchAllTasks();
-    taskCaches.set(portalId, { fetchedAt: Date.now(), tasks: fetched });
+    // One request when we only need the caller's own tasks; a capped sweep
+    // only when explicitly asked for everyone's.
+    const fetched = mineOnly ? await fetchMyTasks() : await fetchAllTasks();
+    taskCaches.set(cacheKey, { fetchedAt: Date.now(), tasks: fetched });
     log.info(`fetched ${fetched.length} tasks for ${label}`);
   }
 
-  let tasks = taskCaches.get(portalId)!.tasks;
-  if (mineOnly) tasks = tasks.filter((t) => t.owner_ids.includes(userId));
+  let tasks = taskCaches.get(cacheKey)!.tasks;
+  // /mytasks/ is already scoped to the caller, so no owner filter is applied
+  // there -- applying one would wrongly drop everything when the two id
+  // spaces disagree, which they do on some portals.
+  if (!mineOnly && userId) tasks = tasks.filter((t) => t.owner_ids.includes(userId));
   if (openOnly) tasks = tasks.filter((t) => !t.completed);
   if (projectName) {
     const needle = projectName.toLowerCase();
@@ -357,7 +419,7 @@ export async function getTasks(query: TaskQuery = {}): Promise<Task[]> {
 export async function resolveIdentityFromTasks(
   zpuid: string,
 ): Promise<TaskOwner | null> {
-  const tasks = await getTasks({ mineOnly: false, openOnly: false });
+  const tasks = await getTasks({ mineOnly: true, openOnly: false });
   for (const task of tasks) {
     for (const owner of task.owners) {
       if (owner.zpuid === zpuid && owner.portalUserId) return owner;
