@@ -213,6 +213,13 @@ export function createServer(): McpServer {
           .string()
           .optional()
           .describe("Exact Zoho task id. Use this after a clarification round-trip."),
+        project_id: z
+          .string()
+          .optional()
+          .describe(
+            "Project the task belongs to. Pass it alongside task_id — it makes the lookup " +
+              "one direct request instead of a search.",
+          ),
         hours: z.number().positive().describe("Decimal hours, e.g. 2.5 for two and a half hours."),
         date: z.string().describe("Date of the work in YYYY-MM-DD."),
         notes: z.string().optional().describe("Free-text note stored on the timesheet entry."),
@@ -238,6 +245,7 @@ export function createServer(): McpServer {
         const {
           task_name,
           task_id,
+          project_id,
           hours,
           date,
           notes,
@@ -246,7 +254,7 @@ export function createServer(): McpServer {
           dry_run,
         } = input;
 
-        const requested = { task_name, task_id, hours, date, notes, bill_status, dry_run };
+        const requested = { task_name, task_id, project_id, hours, date, notes, bill_status, dry_run };
 
         if (!task_id && !task_name) {
           return fail("Provide either task_id or task_name.");
@@ -260,7 +268,7 @@ export function createServer(): McpServer {
         let task: Task | null = null;
 
         if (task_id) {
-          task = await getTaskById(task_id);
+          task = await getTaskById(task_id, project_id);
           if (!task) {
             audit({ outcome: "refused_no_match", requested });
             return fail(

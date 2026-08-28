@@ -483,9 +483,32 @@ export async function resolveIdentityFromTasks(): Promise<TaskOwner | null> {
   return common[0].portalUserId ? common[0] : null;
 }
 
-export async function getTaskById(taskId: string): Promise<Task | null> {
-  const all = await getTasks({ mineOnly: false, openOnly: false });
-  return all.find((t) => t.task_id === String(taskId)) ?? null;
+/**
+ * Look up one task by id.
+ *
+ * With a project id this is a single direct GET. Without one, it searches the
+ * caller's own tasks -- also a single request. It must never fall back to
+ * scanning the portal: that is thousands of requests to find a task whose id
+ * we already know, and it is what made log_time unusable on a large portal.
+ */
+export async function getTaskById(
+  taskId: string,
+  projectId?: string,
+): Promise<Task | null> {
+  const id = String(taskId);
+
+  if (projectId) {
+    try {
+      const json = await request<any>(`projects/${projectId}/tasks/${id}/`);
+      const raw = json.tasks?.[0] ?? json.task;
+      if (raw) return toTask(raw, "", projectId);
+    } catch (err) {
+      log.warn(`direct task lookup failed for ${id} in project ${projectId}`, String(err));
+    }
+  }
+
+  const mine = await getTasks({ mineOnly: true, openOnly: false });
+  return mine.find((t) => t.task_id === id) ?? null;
 }
 
 export interface CreateTaskInput {
