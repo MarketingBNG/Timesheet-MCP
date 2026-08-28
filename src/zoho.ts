@@ -209,7 +209,17 @@ export interface Task {
   status: string;
   completed: boolean;
   owner_ids: string[];
+  /** Full owner records — the only place a Team Member can see both id spaces. */
+  owners: TaskOwner[];
   last_updated?: string;
+}
+
+export interface TaskOwner {
+  zpuid: string;
+  /** The 600... id that timelogs are stamped with. */
+  portalUserId: string;
+  email: string;
+  name: string;
 }
 
 interface TaskCache {
@@ -295,6 +305,12 @@ async function fetchProjectTasks(projectId: string, projectName: string): Promis
           .flatMap((o) => [o.zpuid, o.id, o.owner_id])
           .map((v) => String(v ?? ""))
           .filter(Boolean),
+        owners: owners.map((o) => ({
+          zpuid: String(o.zpuid ?? ""),
+          portalUserId: String(o.id ?? o.owner_id ?? ""),
+          email: String(o.email ?? ""),
+          name: String(o.full_name ?? o.name ?? ""),
+        })),
         last_updated: t.last_updated_time ?? t.created_time,
       });
     }
@@ -328,6 +344,26 @@ export async function getTasks(query: TaskQuery = {}): Promise<Task[]> {
     tasks = tasks.filter((t) => t.project_name.toLowerCase().includes(needle));
   }
   return tasks;
+}
+
+/**
+ * Find a user's portal user id (600...) by scanning task owner records.
+ *
+ * The /users/ endpoint returns 6401 for anyone who is not a portal admin, so
+ * for most people this is the only readable source that carries both id
+ * spaces. Works for anyone who owns at least one task — which is exactly the
+ * population that logs time.
+ */
+export async function resolveIdentityFromTasks(
+  zpuid: string,
+): Promise<TaskOwner | null> {
+  const tasks = await getTasks({ mineOnly: false, openOnly: false });
+  for (const task of tasks) {
+    for (const owner of task.owners) {
+      if (owner.zpuid === zpuid && owner.portalUserId) return owner;
+    }
+  }
+  return null;
 }
 
 export async function getTaskById(taskId: string): Promise<Task | null> {
@@ -378,6 +414,7 @@ export async function createTask(input: CreateTaskInput): Promise<Task> {
     status: String(raw?.status?.name ?? raw?.status ?? "Open"),
     completed: false,
     owner_ids: owners,
+    owners: owners.map((id) => ({ zpuid: id, portalUserId: "", email: "", name: "" })),
   };
 }
 

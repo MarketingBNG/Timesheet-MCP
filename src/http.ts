@@ -16,7 +16,7 @@ import {
   pruneExpiredTokens,
   updateUserDetails,
 } from "./store.js";
-import { getPortalMeta } from "./zoho.js";
+import { getPortalMeta, resolveIdentityFromTasks } from "./zoho.js";
 import { getAccessToken } from "./auth.js";
 
 /**
@@ -128,17 +128,41 @@ async function backfillPortalUserId(ctx: UserContext): Promise<UserContext> {
   if (ctx.portalUserId) return ctx;
 
   try {
+    // Preferred: the portal user list. Admin-only — returns 6401 for a
+    // Team Member, which is most people.
     const accessToken = await runWithUser(ctx, () => getAccessToken());
-    const looked = await lookupPortalUser(accessToken, ctx.portalId, ctx.zpuid);
-    if (!looked?.portalUserId) return ctx;
+    let found = await lookupPortalUser(accessToken, ctx.portalId, ctx.zpuid);
+
+    // Fallback: task owner records, which every user can read and which
+    // carry both id spaces plus the person's email.
+    if (!found?.portalUserId) {
+      const owner = await runWithUser(ctx, () => resolveIdentityFromTasks(ctx.zpuid));
+      if (owner) {
+        found = { portalUserId: owner.portalUserId, email: owner.email, name: owner.name };
+        log.info(`resolved ${ctx.zpuid} from task owner records`);
+      }
+    }
+
+    if (!found?.portalUserId) {
+      log.warn(
+        `could not resolve a portal user id for ${ctx.zpuid} — timesheet reads will not ` +
+          `be filtered to this user until they own at least one task`,
+      );
+      return ctx;
+    }
 
     await updateUserDetails(ctx.zpuid, {
-      portalUserId: looked.portalUserId,
-      email: looked.email,
-      name: looked.name,
+      portalUserId: found.portalUserId,
+      email: found.email,
+      name: found.name,
     });
-    log.info(`backfilled portal user id for ${looked.email || ctx.zpuid}`);
-    return { ...ctx, portalUserId: looked.portalUserId, email: looked.email || ctx.email };
+    log.info(`backfilled portal user id for ${found.email || ctx.zpuid}`);
+    return {
+      ...ctx,
+      portalUserId: found.portalUserId,
+      email: found.email || ctx.email,
+      name: found.name || ctx.name,
+    };
   } catch (err) {
     log.warn("portal user id backfill failed", String(err));
     return ctx;
