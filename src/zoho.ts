@@ -255,6 +255,8 @@ export interface Task {
   project_id: string;
   project_name: string;
   status: string;
+  /** Zoho's id for the custom status; needed to change it. */
+  status_id: string;
   completed: boolean;
   owner_ids: string[];
   /** Full owner records — the only place a Team Member can see both id spaces. */
@@ -416,6 +418,7 @@ function toTask(t: any, projectName: string, projectId = ""): Task {
     project_id: String(t.project?.id_string ?? t.project?.id ?? projectId),
     project_name: String(t.project?.name || projectName),
     status: statusName,
+    status_id: String(t.status?.id_string ?? t.status?.id ?? ""),
     completed:
       t.completed === true ||
       String(t.status?.type ?? "").toLowerCase() === "closed" ||
@@ -620,6 +623,7 @@ export async function createTask(input: CreateTaskInput): Promise<Task> {
     project_id: String(raw?.project?.id_string ?? raw?.project?.id ?? input.projectId),
     project_name: String(raw?.project?.name ?? ""),
     status: String(raw?.status?.name ?? raw?.status ?? "Open"),
+    status_id: String(raw?.status?.id_string ?? raw?.status?.id ?? ""),
     completed: false,
     owner_ids: owners.flatMap((o) => [o.zpuid, o.portalUserId]).filter(Boolean),
     owners,
@@ -640,9 +644,10 @@ const statusCache = new Map<string, TaskStatus[]>();
 /**
  * The statuses this project's workflow actually defines.
  *
- * Projects define their own status names ("In Progress", "In Review", ...)
- * and Zoho identifies them by id. Sending a name is silently ignored, which
- * is why status changes appeared to succeed and did nothing.
+ * Zoho exposes no reliable endpoint for this on every portal, so after trying
+ * the documented paths we fall back to reading the statuses off the project's
+ * own tasks. Every task carries its status id and name, which is exactly what
+ * a status change needs, and any user who can see the tasks can read it.
  */
 export async function listTaskStatuses(projectId: string): Promise<TaskStatus[]> {
   const key = `${effective().portalId}:${projectId}`;
@@ -652,29 +657,57 @@ export async function listTaskStatuses(projectId: string): Promise<TaskStatus[]>
   const paths = [
     `projects/${projectId}/tasks/customstatus/`,
     `projects/${projectId}/customstatus/`,
+    `projects/${projectId}/statuses/`,
   ];
 
   for (const path of paths) {
     try {
       const json = await request<any>(path);
       const rows: any[] = json.status ?? json.statuses ?? json.customstatus ?? [];
-      if (rows.length === 0) continue;
+      const statuses = rows
+        .map((r) => ({
+          id: String(r.id_string ?? r.id ?? ""),
+          name: String(r.name ?? r.status_name ?? ""),
+          type: String(r.type ?? r.status_type ?? "").toLowerCase(),
+          isDefault: r.is_default === true || r.default === true,
+        }))
+        .filter((st) => st.id && st.name);
 
-      const statuses = rows.map((r) => ({
-        id: String(r.id_string ?? r.id ?? ""),
-        name: String(r.name ?? r.status_name ?? ""),
-        type: String(r.type ?? r.status_type ?? "").toLowerCase(),
-        isDefault: r.is_default === true || r.default === true,
-      }));
-
-      statusCache.set(key, statuses);
-      log.info(
-        `project ${projectId} statuses: ${statuses.map((x) => x.name).join(", ")}`,
-      );
-      return statuses;
+      if (statuses.length > 0) {
+        statusCache.set(key, statuses);
+        log.info(`project ${projectId} statuses via ${path}: ${statuses.map((x) => x.name).join(", ")}`);
+        return statuses;
+      }
     } catch (err) {
       log.debug(`status lookup failed at ${path}`, String(err));
     }
+  }
+
+  // Fallback: whatever statuses the project's tasks are actually using.
+  try {
+    const tasks = await fetchProjectTasks(projectId, "");
+    const byId = new Map<string, TaskStatus>();
+    for (const t of tasks) {
+      if (t.status_id && t.status && !byId.has(t.status_id)) {
+        byId.set(t.status_id, {
+          id: t.status_id,
+          name: t.status,
+          type: t.completed ? "closed" : "open",
+          isDefault: false,
+        });
+      }
+    }
+    const statuses = [...byId.values()];
+    if (statuses.length > 0) {
+      statusCache.set(key, statuses);
+      log.info(
+        `project ${projectId} statuses derived from tasks: ` +
+          statuses.map((x) => x.name).join(", "),
+      );
+      return statuses;
+    }
+  } catch (err) {
+    log.warn(`could not derive statuses from tasks in ${projectId}`, String(err));
   }
 
   log.warn(`could not read custom statuses for project ${projectId}`);
@@ -721,20 +754,30 @@ export async function updateTask(input: UpdateTaskInput): Promise<Task> {
   // Zoho identifies custom statuses by id. A name is accepted and ignored,
   // so resolve it first and fail loudly rather than silently doing nothing.
   let statusId: string | undefined;
+  let statusName: string | undefined;
+
   if (input.status) {
     const match = await resolveStatusId(input.projectId, input.status);
-    if (!match) {
+    if (match) {
+      statusId = match.id;
+    } else {
       const known = (await listTaskStatuses(input.projectId)).map((st) => st.name);
-      throw new ZohoError(
-        `"${input.status}" is not a status in this project's workflow.`,
-        undefined,
-        undefined,
-        known.length
-          ? `Available statuses: ${known.join(", ")}.`
-          : "This project's status list could not be read.",
+      if (known.length > 0) {
+        throw new ZohoError(
+          `"${input.status}" is not a status in this project's workflow.`,
+          undefined,
+          undefined,
+          `Available statuses: ${known.join(", ")}.`,
+        );
+      }
+      // Statuses could not be read at all. Send the name and let Zoho decide,
+      // rather than refusing a change that may well work.
+      log.warn(
+        `status list unavailable for project ${input.projectId}; ` +
+          `sending "${input.status}" by name`,
       );
+      statusName = input.status;
     }
-    statusId = match.id;
   }
 
   const json = await request<any>(
@@ -744,6 +787,8 @@ export async function updateTask(input: UpdateTaskInput): Promise<Task> {
       form: {
         name: input.name,
         custom_status: statusId,
+        custom_status_name: statusName,
+        status: statusName,
         priority: input.priority,
         description: input.description,
         start_date: input.startIso ? toPortalDate(input.startIso, API_DATE_FORMAT) : undefined,
