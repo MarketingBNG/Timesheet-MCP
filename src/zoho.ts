@@ -416,16 +416,36 @@ export async function getTasks(query: TaskQuery = {}): Promise<Task[]> {
  * spaces. Works for anyone who owns at least one task — which is exactly the
  * population that logs time.
  */
-export async function resolveIdentityFromTasks(
-  zpuid: string,
-): Promise<TaskOwner | null> {
+export async function resolveIdentityFromTasks(): Promise<TaskOwner | null> {
   const tasks = await getTasks({ mineOnly: true, openOnly: false });
+  if (tasks.length === 0) return null;
+
+  // Every task /mytasks/ returns is one the caller owns, so the caller is the
+  // owner common to all of them. Intersecting is what makes this work when a
+  // task has several owners.
+  let common: TaskOwner[] | null = null;
   for (const task of tasks) {
-    for (const owner of task.owners) {
-      if (owner.zpuid === zpuid && owner.portalUserId) return owner;
+    if (task.owners.length === 0) continue;
+    if (common === null) {
+      common = [...task.owners];
+    } else {
+      common = common.filter((c) =>
+        task.owners.some((o) => o.portalUserId === c.portalUserId),
+      );
     }
+    if (common.length === 1) break;
   }
-  return null;
+
+  if (!common || common.length === 0) return null;
+
+  if (common.length > 1) {
+    log.warn(
+      `could not single out the caller: ${common.length} owners appear on every task`,
+    );
+    return null;
+  }
+
+  return common[0].portalUserId ? common[0] : null;
 }
 
 export async function getTaskById(taskId: string): Promise<Task | null> {
@@ -586,22 +606,77 @@ function monthsSpanning(fromIso: string, toIso: string): string[] {
  * per month, then filtered client-side. Both verified against the live API.
  */
 export async function listTimeLogs(query: LogQuery): Promise<TimeLog[]> {
-  const projects = await listProjects(true);
-  const months = monthsSpanning(query.fromIso, query.toIso);
   const ownerFilter = query.users ?? effective().timelogOwnerId;
 
-  const calls: Array<Promise<TimeLog[]>> = [];
-  for (const project of projects.slice(0, PROJECT_SWEEP_CAP)) {
-    for (const month of months) {
-      calls.push(fetchProjectMonthLogs(project, month));
+  // Driven by the caller's own tasks rather than by projects. Portals here
+  // expose thousands of projects, so enumerating them both misses most logs
+  // and trips Zoho's throttle; a person's own tasks are a handful.
+  const tasks = await getTasks({ mineOnly: true, openOnly: false });
+
+  if (tasks.length > 0) {
+    const targets = tasks.slice(0, TASK_LOG_SCAN_CAP);
+    if (tasks.length > targets.length) {
+      log.warn(
+        `scanning logs for the first ${targets.length} of ${tasks.length} tasks`,
+      );
     }
+
+    const batches = await Promise.all(
+      targets.map((t) => fetchTaskLogs(t).catch(() => [] as TimeLog[])),
+    );
+
+    return batches
+      .flat()
+      .filter((l) => l.date >= query.fromIso && l.date <= query.toIso)
+      .filter((l) => !ownerFilter || ownerFilter === "all" || l.owner_id === ownerFilter);
   }
 
-  const all = (await Promise.all(calls)).flat();
+  // No tasks of their own: fall back to a capped project scan so the tool
+  // still answers rather than returning a bare zero.
+  const projects = (await listProjects(true)).slice(0, PROJECT_SWEEP_CAP);
+  const months = monthsSpanning(query.fromIso, query.toIso);
+  const calls: Array<Promise<TimeLog[]>> = [];
+  for (const project of projects) {
+    for (const month of months) calls.push(fetchProjectMonthLogs(project, month));
+  }
 
-  return all
+  return (await Promise.all(calls))
+    .flat()
     .filter((l) => l.date >= query.fromIso && l.date <= query.toIso)
     .filter((l) => !ownerFilter || ownerFilter === "all" || l.owner_id === ownerFilter);
+}
+
+/** Max tasks whose logs are read for one timesheet query. */
+const TASK_LOG_SCAN_CAP = Number(process.env.TASK_LOG_SCAN_CAP ?? 40);
+
+/** Every timelog on one task. Cheap, and scoped to work the caller owns. */
+async function fetchTaskLogs(task: Task): Promise<TimeLog[]> {
+  const json = await request<any>(
+    `projects/${task.project_id}/tasks/${task.task_id}/logs/`,
+    { query: { index: 1, range: 200 } },
+  );
+
+  const out: TimeLog[] = [];
+  const buckets: any[] = json.timelogs?.date ?? [];
+  const flat: any[] = json.timelogs?.tasklogs ?? [];
+
+  const push = (entry: any, bucketDate?: string) => {
+    const log = normaliseLog(entry, API_DATE_FORMAT, undefined, bucketDate);
+    out.push({
+      ...log,
+      task_id: log.task_id ?? task.task_id,
+      task_name: log.task_name ?? task.task_name,
+      project_id: log.project_id ?? task.project_id,
+      project_name: log.project_name ?? task.project_name,
+    });
+  };
+
+  for (const bucket of buckets) {
+    for (const entry of bucket.tasklogs ?? []) push(entry, bucket.date);
+  }
+  for (const entry of flat) push(entry);
+
+  return out;
 }
 
 async function fetchProjectMonthLogs(

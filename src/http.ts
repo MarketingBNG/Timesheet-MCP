@@ -136,7 +136,7 @@ async function backfillPortalUserId(ctx: UserContext): Promise<UserContext> {
     // Fallback: task owner records, which every user can read and which
     // carry both id spaces plus the person's email.
     if (!found?.portalUserId) {
-      const owner = await runWithUser(ctx, () => resolveIdentityFromTasks(ctx.zpuid));
+      const owner = await runWithUser(ctx, () => resolveIdentityFromTasks());
       if (owner) {
         found = { portalUserId: owner.portalUserId, email: owner.email, name: owner.name };
         log.info(`resolved ${ctx.zpuid} from task owner records`);
