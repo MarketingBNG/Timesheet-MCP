@@ -662,6 +662,35 @@ export async function createTimeLog(input: CreateLogInput): Promise<TimeLog> {
   return normaliseLog(raw, dateFormat, input.isoDate);
 }
 
+export interface UpdateLogInput {
+  projectId: string;
+  taskId: string;
+  logId: string;
+  isoDate?: string;
+  hoursHHMM?: string;
+  notes?: string;
+  billStatus?: string;
+}
+
+/** Edit an existing timelog in place. Only the fields supplied are sent. */
+export async function updateTimeLog(input: UpdateLogInput): Promise<TimeLog> {
+  const json = await request<any>(
+    `projects/${input.projectId}/tasks/${input.taskId}/logs/${input.logId}/`,
+    {
+      method: "POST",
+      form: {
+        date: input.isoDate ? toPortalDate(input.isoDate, API_DATE_FORMAT) : undefined,
+        hours: input.hoursHHMM,
+        notes: input.notes,
+        bill_status: input.billStatus,
+      },
+    },
+  );
+
+  const raw = json.timelogs?.tasklogs?.[0] ?? json.tasklogs?.[0] ?? json;
+  return normaliseLog(raw, API_DATE_FORMAT, input.isoDate);
+}
+
 export async function deleteTimeLog(
   projectId: string,
   taskId: string,

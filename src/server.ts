@@ -23,6 +23,7 @@ import {
   createTask,
   updateTask,
   createTimeLog,
+  updateTimeLog,
   fetchTaskLogs,
   deleteTimeLog,
   getPortalMeta,
@@ -620,6 +621,204 @@ export function createServer(): McpServer {
           `Updated "${task.task_name}" [${task.task_id}]. Status is now ${task.status || "unchanged"}.`,
           taskView(task),
         );
+      }),
+  );
+
+  /* --------------------------- update_time_log ---------------------------- */
+
+  server.registerTool(
+    "update_time_log",
+    {
+      title: "Edit a timesheet entry",
+      description:
+        "Change the hours, date, notes or billing of an existing entry, in place. Get the " +
+        "log_id from get_timesheet_status with include_entries:true. Only the fields you " +
+        "pass are altered.",
+      inputSchema: {
+        log_id: z.string().describe("The timesheet entry to edit."),
+        task_id: z.string().describe("Task the entry belongs to."),
+        project_id: z.string().describe("Project the task belongs to."),
+        hours: z.number().positive().optional().describe("New duration in decimal hours."),
+        date: z.string().optional().describe("Move the entry to this date, YYYY-MM-DD."),
+        notes: z.string().optional().describe("Replace the note."),
+        bill_status: z.enum(["Billable", "Non Billable"]).optional(),
+      },
+    },
+    async ({ log_id, task_id, project_id, hours, date, notes, bill_status }) =>
+      guarded(async () => {
+        if (date) assertIsoDate(date, "date");
+
+        if (hours === undefined && !date && notes === undefined && !bill_status) {
+          return fail("Nothing to change — pass at least one of hours, date, notes or bill_status.");
+        }
+
+        const hoursHHMM = hours === undefined ? undefined : hoursToHHMM(hours);
+
+        try {
+          const updated = await updateTimeLog({
+            projectId: project_id,
+            taskId: task_id,
+            logId: log_id,
+            isoDate: date,
+            hoursHHMM,
+            notes,
+            billStatus: bill_status,
+          });
+
+          audit({
+            outcome: "created",
+            requested: { action: "update_time_log", log_id, task_id, hours, date, notes },
+            resolved: { log_id, hours_hhmm: hoursHHMM, date },
+          });
+
+          return ok(
+            `Updated entry ${log_id}` +
+              (hours !== undefined ? ` to ${hours}h (${hoursHHMM})` : "") +
+              (date ? ` on ${date}` : "") +
+              ".",
+            logView(updated),
+          );
+        } catch (err) {
+          audit({
+            outcome: "error",
+            requested: { action: "update_time_log", log_id, task_id },
+            error: explain(err),
+          });
+          throw err;
+        }
+      }),
+  );
+
+  /* ---------------------------- bulk_log_time ----------------------------- */
+
+  server.registerTool(
+    "bulk_log_time",
+    {
+      title: "Log several timesheet entries at once",
+      description:
+        "File a whole week in one call. Every entry must carry an exact task_id and " +
+        "project_id — no fuzzy matching here, because a wrong guess repeated across a week " +
+        "is much worse than a single bad entry. Resolve names with get_my_tasks first.\n\n" +
+        "Entries are written one at a time and the result reports each outcome separately, " +
+        "so a partial failure is visible rather than silent.",
+      inputSchema: {
+        entries: z
+          .array(
+            z.object({
+              task_id: z.string(),
+              project_id: z.string(),
+              hours: z.number().positive(),
+              date: z.string().describe("YYYY-MM-DD"),
+              notes: z.string().optional(),
+              bill_status: z.enum(["Billable", "Non Billable"]).optional(),
+            }),
+          )
+          .min(1)
+          .max(30)
+          .describe("The entries to file."),
+        skip_duplicates: z
+          .boolean()
+          .default(true)
+          .describe(
+            "Skip any entry whose task already has time on that date, rather than adding a " +
+              "second one. Leave on unless the user has confirmed the duplicates are wanted.",
+          ),
+        dry_run: z
+          .boolean()
+          .default(false)
+          .describe("Validate everything and report what would be filed, without writing."),
+      },
+    },
+    async ({ entries, skip_duplicates, dry_run }) =>
+      guarded(async () => {
+        const results: Array<Record<string, unknown>> = [];
+        let filed = 0;
+        let hoursFiled = 0;
+
+        for (const [i, entry] of entries.entries()) {
+          const label = `#${i + 1} ${entry.date} ${entry.hours}h`;
+
+          try {
+            assertIsoDate(entry.date, `entries[${i}].date`);
+            const hoursHHMM = hoursToHHMM(entry.hours);
+
+            const task = await getTaskById(entry.task_id, entry.project_id);
+            if (!task) {
+              results.push({ ...entry, status: "failed", reason: "task not found" });
+              continue;
+            }
+
+            if (skip_duplicates) {
+              const existing = await fetchTaskLogs(task);
+              if (existing.some((l) => l.date === entry.date)) {
+                results.push({
+                  ...entry,
+                  task_name: task.task_name,
+                  status: "skipped",
+                  reason: "time already logged on this task for this date",
+                });
+                continue;
+              }
+            }
+
+            if (dry_run) {
+              results.push({
+                ...entry,
+                task_name: task.task_name,
+                status: "would_file",
+                hours_hhmm: hoursHHMM,
+              });
+              continue;
+            }
+
+            const created = await createTimeLog({
+              projectId: task.project_id,
+              taskId: task.task_id,
+              isoDate: entry.date,
+              hoursHHMM,
+              notes: entry.notes,
+              billStatus: entry.bill_status ?? config.defaultBillStatus,
+            });
+
+            filed++;
+            hoursFiled += entry.hours;
+            audit({
+              outcome: "created",
+              requested: { action: "bulk_log_time", ...entry },
+              resolved: { task_name: task.task_name, log_id: created.log_id },
+            });
+
+            results.push({
+              ...entry,
+              task_name: task.task_name,
+              status: "filed",
+              log_id: created.log_id,
+            });
+          } catch (err) {
+            const reason = explain(err);
+            audit({
+              outcome: "error",
+              requested: { action: "bulk_log_time", ...entry },
+              error: reason,
+            });
+            results.push({ ...entry, status: "failed", reason });
+            log.warn(`bulk_log_time ${label} failed`, reason);
+          }
+        }
+
+        const counts = results.reduce<Record<string, number>>((acc, r) => {
+          const k = String(r.status);
+          acc[k] = (acc[k] ?? 0) + 1;
+          return acc;
+        }, {});
+
+        const summary = dry_run
+          ? `Dry run — nothing written. ${counts.would_file ?? 0} entr(ies) would be filed, ` +
+            `${counts.skipped ?? 0} skipped, ${counts.failed ?? 0} could not be resolved.`
+          : `Filed ${filed} of ${entries.length} entr(ies), ${hoursFiled.toFixed(2)}h total. ` +
+            `${counts.skipped ?? 0} skipped as duplicates, ${counts.failed ?? 0} failed.`;
+
+        return ok(summary, { wrote_to_zoho: !dry_run && filed > 0, results });
       }),
   );
 
