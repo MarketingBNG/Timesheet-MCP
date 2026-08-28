@@ -388,13 +388,17 @@ export interface CreateTaskInput {
  * waiting on a portal admin.
  */
 export async function createTask(input: CreateTaskInput): Promise<Task> {
-  const owners = input.ownerIds?.length ? input.ownerIds : [effective().userId];
+  // Passing person_responsible with our own zpuid is rejected as "user does
+  // not belong to this project" on portals where the id spaces differ.
+  // Omitting it makes Zoho assign the task to the caller, which is what
+  // "create a task for myself" means anyway.
+  const explicitOwners = input.ownerIds?.length ? input.ownerIds : undefined;
 
   const json = await request<any>(`projects/${input.projectId}/tasks/`, {
     method: "POST",
     form: {
       name: input.name,
-      person_responsible: owners.join(","),
+      person_responsible: explicitOwners?.join(","),
       start_date: input.startIso ? toPortalDate(input.startIso, API_DATE_FORMAT) : undefined,
       end_date: input.endIso ? toPortalDate(input.endIso, API_DATE_FORMAT) : undefined,
       description: input.description,
@@ -406,6 +410,16 @@ export async function createTask(input: CreateTaskInput): Promise<Task> {
   // The new task must be visible to the very next log_time call.
   clearTaskCache();
 
+  // Read the owners back rather than assuming: this is how a user with no
+  // prior tasks discovers their own portal user id.
+  const rawOwners: any[] = raw?.details?.owners ?? raw?.owners ?? [];
+  const owners: TaskOwner[] = rawOwners.map((o) => ({
+    zpuid: String(o.zpuid ?? ""),
+    portalUserId: String(o.id ?? o.owner_id ?? ""),
+    email: String(o.email ?? ""),
+    name: String(o.full_name ?? o.name ?? ""),
+  }));
+
   return {
     task_id: String(raw?.id_string ?? raw?.id ?? ""),
     task_name: String(raw?.name ?? input.name),
@@ -413,8 +427,8 @@ export async function createTask(input: CreateTaskInput): Promise<Task> {
     project_name: String(raw?.project?.name ?? ""),
     status: String(raw?.status?.name ?? raw?.status ?? "Open"),
     completed: false,
-    owner_ids: owners,
-    owners: owners.map((id) => ({ zpuid: id, portalUserId: "", email: "", name: "" })),
+    owner_ids: owners.flatMap((o) => [o.zpuid, o.portalUserId]).filter(Boolean),
+    owners,
   };
 }
 
