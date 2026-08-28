@@ -1,0 +1,31 @@
+{
+  "name": "zoho-timesheet-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for filing Zoho Projects timesheet entries conversationally",
+  "type": "module",
+  "bin": {
+    "zoho-timesheet-mcp": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "start:http": "node dist/http.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.22.2",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.25",
+    "@types/node": "^22.9.0",
+    "typescript": "^5.6.3"
+  }
+}
