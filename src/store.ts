@@ -75,6 +75,17 @@ export async function initStore(): Promise<void> {
     );
 
     CREATE INDEX IF NOT EXISTS tokens_zpuid_idx ON tokens (zpuid);
+
+    -- In-flight OAuth state. In memory this was lost on every restart, which
+    -- on an ephemeral host means users hitting "link expired" mid-sign-in,
+    -- and it broke outright with more than one instance.
+    CREATE TABLE IF NOT EXISTS oauth_flows (
+      kind       TEXT NOT NULL,
+      key        TEXT NOT NULL,
+      payload    JSONB NOT NULL,
+      expires_at BIGINT NOT NULL,
+      PRIMARY KEY (kind, key)
+    );
   `);
 
   const { rows } = await db().query<{ count: string }>("SELECT count(*) FROM users");
@@ -228,6 +239,48 @@ export async function getClient(clientId: string): Promise<StoredClient | undefi
     clientName: rows[0].client_name,
     redirectUris: rows[0].redirect_uris,
   };
+}
+
+/* ---------------------------- oauth flows ---------------------------- */
+
+export type FlowKind = "pending" | "code";
+
+export async function saveFlow(
+  kind: FlowKind,
+  key: string,
+  payload: unknown,
+  expiresAt: number,
+): Promise<void> {
+  await db().query(
+    `INSERT INTO oauth_flows (kind, key, payload, expires_at)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (kind, key) DO UPDATE SET payload = EXCLUDED.payload,
+                                           expires_at = EXCLUDED.expires_at`,
+    [kind, key, JSON.stringify(payload), expiresAt],
+  );
+}
+
+/**
+ * Read and delete in one step. Authorization codes and OAuth state are
+ * single-use by definition, and deleting as part of the read is what stops
+ * the same code being redeemed twice by concurrent requests.
+ */
+export async function takeFlow<T>(kind: FlowKind, key: string): Promise<T | null> {
+  const { rows } = await db().query(
+    "DELETE FROM oauth_flows WHERE kind = $1 AND key = $2 RETURNING payload, expires_at",
+    [kind, key],
+  );
+  const row = rows[0];
+  if (!row) return null;
+  if (Number(row.expires_at) < Date.now()) return null;
+  return row.payload as T;
+}
+
+export async function pruneExpiredFlows(): Promise<number> {
+  const { rowCount } = await db().query("DELETE FROM oauth_flows WHERE expires_at < $1", [
+    Date.now(),
+  ]);
+  return rowCount ?? 0;
 }
 
 /* ------------------------------- tokens ------------------------------ */

@@ -13,6 +13,7 @@ import {
   getUser,
   getUserRefreshToken,
   initStore,
+  pruneExpiredFlows,
   pruneExpiredTokens,
   updateUserDetails,
 } from "./store.js";
@@ -55,7 +56,10 @@ app.get("/healthz", (_req: Request, res: Response) => {
 
 if (oauthEnabled) {
   app.use(oauthRouter());
-  setInterval(() => void pruneExpiredTokens(), 15 * 60 * 1000).unref();
+  setInterval(() => {
+    void pruneExpiredTokens();
+    void pruneExpiredFlows();
+  }, 15 * 60 * 1000).unref();
 }
 
 /**
@@ -126,6 +130,17 @@ async function authenticate(req: Request, res: Response): Promise<UserContext | 
 const RESOLVE_RETRY_MS = 30 * 60 * 1000;
 const resolveAttempts = new Map<string, number>();
 
+/** Keep the retry map from growing without bound over a long uptime. */
+function noteAttempt(zpuid: string): void {
+  const now = Date.now();
+  if (resolveAttempts.size > 500) {
+    for (const [k, t] of resolveAttempts) {
+      if (now - t > RESOLVE_RETRY_MS) resolveAttempts.delete(k);
+    }
+  }
+  resolveAttempts.set(zpuid, now);
+}
+
 /**
  * Users who own no tasks, or who connected before the users scope was added,
  * have no portal user id, so their timesheet cannot be filtered to just them.
@@ -137,7 +152,7 @@ async function backfillPortalUserId(ctx: UserContext): Promise<UserContext> {
 
   const lastTried = resolveAttempts.get(ctx.zpuid) ?? 0;
   if (Date.now() - lastTried < RESOLVE_RETRY_MS) return ctx;
-  resolveAttempts.set(ctx.zpuid, Date.now());
+  noteAttempt(ctx.zpuid);
 
   try {
     // Preferred: the portal user list. Admin-only — returns 6401 for a

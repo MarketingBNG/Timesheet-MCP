@@ -9,7 +9,9 @@ import {
   getToken,
   registerClient,
   revokeToken,
+  saveFlow,
   saveToken,
+  takeFlow,
   upsertUser,
 } from "./store.js";
 
@@ -35,15 +37,20 @@ export const oauthEnabled = Boolean(publicUrl && process.env.TOKEN_ENCRYPTION_KE
 const ACCESS_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hour
 const AUTH_CODE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
-/** In-flight authorizations, keyed by the state we hand Zoho. Short-lived. */
+/**
+ * In-flight authorizations and issued codes live in Postgres, not memory.
+ * Held in memory they were lost whenever the process restarted -- routine on
+ * an ephemeral host -- stranding anyone mid-sign-in, and they broke outright
+ * as soon as more than one instance was running.
+ */
+
+/** Keyed by the state we hand Zoho. Short-lived. */
 interface Pending {
   clientId: string;
   clientRedirectUri: string;
   clientState?: string;
   codeChallenge: string;
-  expiresAt: number;
 }
-const pending = new Map<string, Pending>();
 
 /** Codes we issued to the MCP client, awaiting exchange at /token. */
 interface IssuedCode {
@@ -51,16 +58,7 @@ interface IssuedCode {
   clientId: string;
   redirectUri: string;
   codeChallenge: string;
-  expiresAt: number;
 }
-const issuedCodes = new Map<string, IssuedCode>();
-
-function sweep(): void {
-  const now = Date.now();
-  for (const [k, v] of pending) if (v.expiresAt < now) pending.delete(k);
-  for (const [k, v] of issuedCodes) if (v.expiresAt < now) issuedCodes.delete(k);
-}
-setInterval(sweep, 60_000).unref();
 
 const callbackUri = () => `${publicUrl}/callback`;
 
@@ -252,13 +250,17 @@ export function oauthRouter(): Router {
     }
 
     const zohoState = randomId(24);
-    pending.set(zohoState, {
-      clientId,
-      clientRedirectUri: redirectUri,
-      clientState: state,
-      codeChallenge,
-      expiresAt: Date.now() + AUTH_CODE_TTL_MS,
-    });
+    await saveFlow(
+      "pending",
+      zohoState,
+      {
+        clientId,
+        clientRedirectUri: redirectUri,
+        clientState: state,
+        codeChallenge,
+      } satisfies Pending,
+      Date.now() + AUTH_CODE_TTL_MS,
+    );
 
     const zohoAuth = new URL(`${config.accountsBase}/oauth/v2/auth`);
     zohoAuth.searchParams.set("client_id", config.clientId);
@@ -278,13 +280,13 @@ export function oauthRouter(): Router {
   router.get("/callback", async (req, res) => {
     const zohoState = String(req.query.state ?? "");
     const zohoCode = String(req.query.code ?? "");
-    const flow = pending.get(zohoState);
+    // Single-use: takeFlow reads and deletes atomically.
+    const flow = await takeFlow<Pending>("pending", zohoState);
 
-    if (!flow || flow.expiresAt < Date.now()) {
+    if (!flow) {
       res.status(400).send(page("Link expired", "Start the connection again from Claude."));
       return;
     }
-    pending.delete(zohoState);
 
     if (req.query.error) {
       res.status(400).send(page("Zoho declined", String(req.query.error)));
@@ -300,13 +302,17 @@ export function oauthRouter(): Router {
       await upsertUser({ ...identity, refreshToken });
 
       const code = randomId(32);
-      issuedCodes.set(code, {
-        zpuid: identity.zpuid,
-        clientId: flow.clientId,
-        redirectUri: flow.clientRedirectUri,
-        codeChallenge: flow.codeChallenge,
-        expiresAt: Date.now() + AUTH_CODE_TTL_MS,
-      });
+      await saveFlow(
+        "code",
+        code,
+        {
+          zpuid: identity.zpuid,
+          clientId: flow.clientId,
+          redirectUri: flow.clientRedirectUri,
+          codeChallenge: flow.codeChallenge,
+        } satisfies IssuedCode,
+        Date.now() + AUTH_CODE_TTL_MS,
+      );
 
       const back = new URL(flow.clientRedirectUri);
       back.searchParams.set("code", code);
@@ -343,14 +349,15 @@ export function oauthRouter(): Router {
 
     const code = String(req.body?.code ?? "");
     const verifier = String(req.body?.code_verifier ?? "");
-    const record = issuedCodes.get(code);
 
-    if (!record || record.expiresAt < Date.now()) {
+    // Single use, whatever happens next: the read deletes it, which also
+    // stops two concurrent requests redeeming the same code.
+    const record = await takeFlow<IssuedCode>("code", code);
+
+    if (!record) {
       res.status(400).json({ error: "invalid_grant", error_description: "Code expired." });
       return;
     }
-    // Single use, whatever happens next.
-    issuedCodes.delete(code);
 
     if (String(req.body?.redirect_uri ?? "") !== record.redirectUri) {
       res.status(400).json({ error: "invalid_grant", error_description: "redirect_uri mismatch." });
