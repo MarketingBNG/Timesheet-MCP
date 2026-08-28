@@ -626,6 +626,80 @@ export async function createTask(input: CreateTaskInput): Promise<Task> {
   };
 }
 
+export interface TaskStatus {
+  id: string;
+  name: string;
+  /** "open" | "closed" — Zoho's underlying bucket for the custom status. */
+  type: string;
+  isDefault: boolean;
+}
+
+/** Custom statuses are per project, and stable, so cache them per project. */
+const statusCache = new Map<string, TaskStatus[]>();
+
+/**
+ * The statuses this project's workflow actually defines.
+ *
+ * Projects define their own status names ("In Progress", "In Review", ...)
+ * and Zoho identifies them by id. Sending a name is silently ignored, which
+ * is why status changes appeared to succeed and did nothing.
+ */
+export async function listTaskStatuses(projectId: string): Promise<TaskStatus[]> {
+  const key = `${effective().portalId}:${projectId}`;
+  const cached = statusCache.get(key);
+  if (cached) return cached;
+
+  const paths = [
+    `projects/${projectId}/tasks/customstatus/`,
+    `projects/${projectId}/customstatus/`,
+  ];
+
+  for (const path of paths) {
+    try {
+      const json = await request<any>(path);
+      const rows: any[] = json.status ?? json.statuses ?? json.customstatus ?? [];
+      if (rows.length === 0) continue;
+
+      const statuses = rows.map((r) => ({
+        id: String(r.id_string ?? r.id ?? ""),
+        name: String(r.name ?? r.status_name ?? ""),
+        type: String(r.type ?? r.status_type ?? "").toLowerCase(),
+        isDefault: r.is_default === true || r.default === true,
+      }));
+
+      statusCache.set(key, statuses);
+      log.info(
+        `project ${projectId} statuses: ${statuses.map((x) => x.name).join(", ")}`,
+      );
+      return statuses;
+    } catch (err) {
+      log.debug(`status lookup failed at ${path}`, String(err));
+    }
+  }
+
+  log.warn(`could not read custom statuses for project ${projectId}`);
+  statusCache.set(key, []);
+  return [];
+}
+
+/** Match a spoken status name against the project's workflow. */
+export async function resolveStatusId(
+  projectId: string,
+  wanted: string,
+): Promise<TaskStatus | null> {
+  const statuses = await listTaskStatuses(projectId);
+  if (statuses.length === 0) return null;
+
+  const norm = (v: string) => v.trim().toLowerCase().replace(/[\s_-]+/g, " ");
+  const target = norm(wanted);
+
+  return (
+    statuses.find((st) => norm(st.name) === target) ??
+    statuses.find((st) => norm(st.name).startsWith(target)) ??
+    null
+  );
+}
+
 export interface UpdateTaskInput {
   projectId: string;
   taskId: string;
@@ -644,13 +718,32 @@ export interface UpdateTaskInput {
  * change cannot accidentally blank out the description.
  */
 export async function updateTask(input: UpdateTaskInput): Promise<Task> {
+  // Zoho identifies custom statuses by id. A name is accepted and ignored,
+  // so resolve it first and fail loudly rather than silently doing nothing.
+  let statusId: string | undefined;
+  if (input.status) {
+    const match = await resolveStatusId(input.projectId, input.status);
+    if (!match) {
+      const known = (await listTaskStatuses(input.projectId)).map((st) => st.name);
+      throw new ZohoError(
+        `"${input.status}" is not a status in this project's workflow.`,
+        undefined,
+        undefined,
+        known.length
+          ? `Available statuses: ${known.join(", ")}.`
+          : "This project's status list could not be read.",
+      );
+    }
+    statusId = match.id;
+  }
+
   const json = await request<any>(
     `projects/${input.projectId}/tasks/${input.taskId}/`,
     {
       method: "POST",
       form: {
         name: input.name,
-        custom_status_name: input.status,
+        custom_status: statusId,
         priority: input.priority,
         description: input.description,
         start_date: input.startIso ? toPortalDate(input.startIso, API_DATE_FORMAT) : undefined,

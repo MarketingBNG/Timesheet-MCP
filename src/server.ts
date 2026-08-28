@@ -22,6 +22,7 @@ import {
 
   createTask,
   updateTask,
+  listTaskStatuses,
   createTimeLog,
   updateTimeLog,
   fetchTaskLogs,
@@ -623,6 +624,35 @@ export function createServer(): McpServer {
       }),
   );
 
+  /* -------------------------- list_task_statuses -------------------------- */
+
+  server.registerTool(
+    "list_task_statuses",
+    {
+      title: "List a project's task statuses",
+      description:
+        "The status names this project's workflow defines. Projects define their own, and " +
+        "update_task only accepts one of these — call this first if a status name is rejected.",
+      inputSchema: {
+        project_id: z.string().describe("Project whose workflow to read."),
+      },
+    },
+    async ({ project_id }) =>
+      guarded(async () => {
+        const statuses = await listTaskStatuses(project_id);
+        if (statuses.length === 0) {
+          return fail(
+            `Could not read the status list for project ${project_id}. Status changes on ` +
+              `this project may not be possible through the API.`,
+          );
+        }
+        return ok(
+          `${statuses.length} status(es): ${statuses.map((s2) => s2.name).join(", ")}`,
+          statuses,
+        );
+      }),
+  );
+
   /* ------------------------------ update_task ----------------------------- */
 
   server.registerTool(
@@ -639,7 +669,11 @@ export function createServer(): McpServer {
         status: z
           .string()
           .optional()
-          .describe('Status name exactly as Zoho spells it, e.g. "Completed", "In Progress".'),
+          .describe(
+            "Status name from this project's own workflow — run list_task_statuses to see " +
+              "them. Matching is case- and spacing-insensitive; an unknown name is rejected " +
+              "rather than silently ignored.",
+          ),
         name: z.string().optional().describe("Rename the task."),
         priority: z.enum(["None", "Low", "Medium", "High"]).optional(),
         description: z.string().optional(),
