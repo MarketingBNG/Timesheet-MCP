@@ -572,6 +572,46 @@ export async function createTask(input: CreateTaskInput): Promise<Task> {
   };
 }
 
+export interface UpdateTaskInput {
+  projectId: string;
+  taskId: string;
+  name?: string;
+  /** Zoho status name, e.g. "Open", "In Progress", "Completed". */
+  status?: string;
+  priority?: string;
+  description?: string;
+  startIso?: string;
+  endIso?: string;
+  percentComplete?: number;
+}
+
+/**
+ * Update an existing task. Only the fields supplied are sent, so a status
+ * change cannot accidentally blank out the description.
+ */
+export async function updateTask(input: UpdateTaskInput): Promise<Task> {
+  const json = await request<any>(
+    `projects/${input.projectId}/tasks/${input.taskId}/`,
+    {
+      method: "POST",
+      form: {
+        name: input.name,
+        custom_status_name: input.status,
+        priority: input.priority,
+        description: input.description,
+        start_date: input.startIso ? toPortalDate(input.startIso, API_DATE_FORMAT) : undefined,
+        end_date: input.endIso ? toPortalDate(input.endIso, API_DATE_FORMAT) : undefined,
+        percent_complete:
+          input.percentComplete === undefined ? undefined : String(input.percentComplete),
+      },
+    },
+  );
+
+  clearTaskCache();
+  const raw = json.tasks?.[0] ?? json.task ?? json;
+  return toTask(raw, "", input.projectId);
+}
+
 /* ------------------------------------------------------------------ *
  * Timelogs
  * ------------------------------------------------------------------ */

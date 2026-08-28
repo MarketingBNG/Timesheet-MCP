@@ -21,6 +21,7 @@ import {
 import {
 
   createTask,
+  updateTask,
   createTimeLog,
   fetchTaskLogs,
   deleteTimeLog,
@@ -543,6 +544,80 @@ export function createServer(): McpServer {
         return ok(
           `Created task "${task.task_name}" [${task.task_id}] in project ${task.project_id}, ` +
             `assigned to ${task.owner_ids.join(", ")}.`,
+          taskView(task),
+        );
+      }),
+  );
+
+  /* ------------------------------ update_task ----------------------------- */
+
+  server.registerTool(
+    "update_task",
+    {
+      title: "Update a Zoho task",
+      description:
+        "Change a task's status, name, priority, dates or completion. Only the fields you " +
+        "pass are altered. Use this to mark work Completed. Status names must match the " +
+        "project's own workflow — get_my_tasks shows the current status of each task.",
+      inputSchema: {
+        task_id: z.string().describe("Task to update."),
+        project_id: z.string().describe("Project the task belongs to."),
+        status: z
+          .string()
+          .optional()
+          .describe('Status name exactly as Zoho spells it, e.g. "Completed", "In Progress".'),
+        name: z.string().optional().describe("Rename the task."),
+        priority: z.enum(["None", "Low", "Medium", "High"]).optional(),
+        description: z.string().optional(),
+        start_date: z.string().optional().describe("YYYY-MM-DD."),
+        end_date: z.string().optional().describe("YYYY-MM-DD."),
+        percent_complete: z.number().min(0).max(100).optional(),
+      },
+    },
+    async ({
+      task_id,
+      project_id,
+      status,
+      name,
+      priority,
+      description,
+      start_date,
+      end_date,
+      percent_complete,
+    }) =>
+      guarded(async () => {
+        if (start_date) assertIsoDate(start_date, "start_date");
+        if (end_date) assertIsoDate(end_date, "end_date");
+
+        const nothingToDo =
+          [status, name, priority, description, start_date, end_date].every(
+            (v) => v === undefined,
+          ) && percent_complete === undefined;
+
+        if (nothingToDo) {
+          return fail("Nothing to update — pass at least one field to change.");
+        }
+
+        const task = await updateTask({
+          projectId: project_id,
+          taskId: task_id,
+          status,
+          name,
+          priority,
+          description,
+          startIso: start_date,
+          endIso: end_date,
+          percentComplete: percent_complete,
+        });
+
+        audit({
+          outcome: "created",
+          requested: { action: "update_task", task_id, project_id, status, name, priority },
+          resolved: { task_id: task.task_id, task_name: task.task_name, status: task.status },
+        });
+
+        return ok(
+          `Updated "${task.task_name}" [${task.task_id}]. Status is now ${task.status || "unchanged"}.`,
           taskView(task),
         );
       }),
