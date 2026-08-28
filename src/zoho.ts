@@ -654,28 +654,22 @@ export async function listTaskStatuses(projectId: string): Promise<TaskStatus[]>
   const cached = statusCache.get(key);
   if (cached) return cached;
 
+  // `tasklayouts` is the documented source of a project's status list; the
+  // others are older shapes still present on some portals.
   const paths = [
+    `projects/${projectId}/tasklayouts`,
     `projects/${projectId}/tasks/customstatus/`,
     `projects/${projectId}/customstatus/`,
-    `projects/${projectId}/statuses/`,
   ];
 
   for (const path of paths) {
     try {
-      const json = await request<any>(path);
-      const rows: any[] = json.status ?? json.statuses ?? json.customstatus ?? [];
-      const statuses = rows
-        .map((r) => ({
-          id: String(r.id_string ?? r.id ?? ""),
-          name: String(r.name ?? r.status_name ?? ""),
-          type: String(r.type ?? r.status_type ?? "").toLowerCase(),
-          isDefault: r.is_default === true || r.default === true,
-        }))
-        .filter((st) => st.id && st.name);
-
+      const statuses = harvestStatuses(await request<any>(path));
       if (statuses.length > 0) {
         statusCache.set(key, statuses);
-        log.info(`project ${projectId} statuses via ${path}: ${statuses.map((x) => x.name).join(", ")}`);
+        log.info(
+          `project ${projectId} statuses via ${path}: ${statuses.map((x) => x.name).join(", ")}`,
+        );
         return statuses;
       }
     } catch (err) {
@@ -713,6 +707,47 @@ export async function listTaskStatuses(projectId: string): Promise<TaskStatus[]>
   log.warn(`could not read custom statuses for project ${projectId}`);
   statusCache.set(key, []);
   return [];
+}
+
+/**
+ * Pull status records out of an arbitrarily shaped response.
+ *
+ * The layout payload nests statuses differently across portal versions, so
+ * rather than guess a path we walk the whole tree for objects that look like
+ * a status: an id, a name, and an open/closed type.
+ */
+function harvestStatuses(json: unknown): TaskStatus[] {
+  const found = new Map<string, TaskStatus>();
+
+  const visit = (node: any): void => {
+    if (node === null || typeof node !== "object") return;
+
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item);
+      return;
+    }
+
+    const id = node.id_string ?? node.id;
+    const name = node.name ?? node.status_name;
+    const type = String(node.type ?? node.status_type ?? "").toLowerCase();
+
+    if (id !== undefined && typeof name === "string" && (type === "open" || type === "closed")) {
+      const key = String(id);
+      if (!found.has(key)) {
+        found.set(key, {
+          id: key,
+          name,
+          type,
+          isDefault: node.is_default === true || node.default === true,
+        });
+      }
+    }
+
+    for (const value of Object.values(node)) visit(value);
+  };
+
+  visit(json);
+  return [...found.values()];
 }
 
 /** Match a spoken status name against the project's workflow. */
