@@ -227,13 +227,21 @@ interface TaskCache {
   tasks: Task[];
 }
 
-/** Per-portal, so one user's cache is never served to another. */
+/**
+ * Keyed by user AND portal. "My tasks" differs per person, so a portal-only
+ * key would serve one user's task list to another — and log_time matches
+ * against whatever is in here.
+ */
 const taskCaches = new Map<string, TaskCache>();
 
+function taskCacheKey(mineOnly: boolean): string {
+  const { portalId, userId, timelogOwnerId } = effective();
+  return `${portalId}:${userId}:${timelogOwnerId}:${mineOnly ? "mine" : "all"}`;
+}
+
 export function clearTaskCache(): void {
-  const portalId = effective().portalId;
-  taskCaches.delete(`${portalId}:mine`);
-  taskCaches.delete(`${portalId}:all`);
+  taskCaches.delete(taskCacheKey(true));
+  taskCaches.delete(taskCacheKey(false));
 }
 
 export interface TaskQuery {
@@ -381,7 +389,7 @@ export async function getTasks(query: TaskQuery = {}): Promise<Task[]> {
   const { mineOnly = true, openOnly = true, projectName, forceRefresh = false } = query;
 
   const { portalId, userId, label } = effective();
-  const cacheKey = `${portalId}:${mineOnly ? "mine" : "all"}`;
+  const cacheKey = taskCacheKey(mineOnly);
   const cached = taskCaches.get(cacheKey);
   const fresh =
     cached !== undefined &&
