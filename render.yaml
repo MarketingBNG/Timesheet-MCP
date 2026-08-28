@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: zoho-timesheet-mcp
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /healthz
+    # A disk is required: it holds every user's Zoho connection.
+    # Without it a redeploy wipes the store and everyone reconnects.
+    disk:
+      name: store
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: STORE_PATH
+        value: /data/store.json
+      - key: ZOHO_DOMAIN
+        value: in
+      # Set these in the Render dashboard, not here.
+      - key: ZOHO_CLIENT_ID
+        sync: false
+      - key: ZOHO_CLIENT_SECRET
+        sync: false
+      - key: TOKEN_ENCRYPTION_KEY
+        sync: false
+      - key: PUBLIC_URL
+        sync: false
