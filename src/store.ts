@@ -1,24 +1,93 @@
-import fs from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
+import pg from "pg";
 import { decrypt, encrypt } from "./crypto.js";
 import { log } from "./logger.js";
 
 /**
- * Persistence for the multi-user OAuth path.
+ * Persistence for the multi-user OAuth path, on Postgres.
  *
- * A JSON file, loaded once and rewritten atomically. At ~100 users this is
- * genuinely adequate — the whole file is a few hundred KB and writes happen
- * only on sign-in and token issue. Swap for Postgres if you outgrow a single
- * instance; the interface below is the seam.
+ * Postgres rather than a local file because the target host has no persistent
+ * disk — a file store would be wiped on every restart and all users would have
+ * to reconnect. This also removes the single-writer constraint, so the service
+ * can run more than one instance.
+ *
+ * Only the OAuth path touches this. stdio and single-account HTTP never call
+ * in here, so DATABASE_URL is required only when OAuth is enabled.
  */
 
-const here = path.dirname(fileURLToPath(import.meta.url));
+const CONNECTION_STRING = process.env.DATABASE_URL?.trim();
 
-const STORE_PATH =
-  process.env.STORE_PATH?.trim() || path.resolve(here, "..", "data", "store.json");
+let pool: pg.Pool | null = null;
 
-/** A person who has connected their Zoho account. */
+function db(): pg.Pool {
+  if (pool) return pool;
+
+  if (!CONNECTION_STRING) {
+    throw new Error(
+      "DATABASE_URL is required when OAuth is enabled. Create a free Postgres " +
+        "database (Neon, Supabase) and set its connection string.",
+    );
+  }
+
+  pool = new pg.Pool({
+    connectionString: CONNECTION_STRING,
+    // Managed Postgres providers terminate TLS at their proxy with a cert
+    // chain node-postgres will not verify by default.
+    ssl: /sslmode=(require|verify)/.test(CONNECTION_STRING)
+      ? { rejectUnauthorized: false }
+      : undefined,
+    max: 5,
+    idleTimeoutMillis: 30_000,
+    connectionTimeoutMillis: 10_000,
+  });
+
+  pool.on("error", (err) => log.error("postgres pool error", err.message));
+  return pool;
+}
+
+/** Create the schema if it is not already there. Safe to run on every boot. */
+export async function initStore(): Promise<void> {
+  await db().query(`
+    CREATE TABLE IF NOT EXISTS users (
+      zpuid             TEXT PRIMARY KEY,
+      portal_user_id    TEXT NOT NULL DEFAULT '',
+      portal_id         TEXT NOT NULL,
+      email             TEXT NOT NULL DEFAULT '',
+      name              TEXT NOT NULL DEFAULT '',
+      refresh_token_enc TEXT NOT NULL,
+      created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    CREATE TABLE IF NOT EXISTS oauth_clients (
+      client_id     TEXT PRIMARY KEY,
+      client_name   TEXT NOT NULL,
+      redirect_uris JSONB NOT NULL,
+      created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    CREATE TABLE IF NOT EXISTS tokens (
+      token      TEXT PRIMARY KEY,
+      zpuid      TEXT NOT NULL,
+      client_id  TEXT NOT NULL,
+      kind       TEXT NOT NULL,
+      expires_at BIGINT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    CREATE INDEX IF NOT EXISTS tokens_zpuid_idx ON tokens (zpuid);
+  `);
+
+  const { rows } = await db().query<{ count: string }>("SELECT count(*) FROM users");
+  log.info(`store ready (postgres): ${rows[0].count} connected user(s)`);
+}
+
+export async function closeStore(): Promise<void> {
+  await pool?.end();
+  pool = null;
+}
+
+/* ------------------------------- types ------------------------------- */
+
 export interface StoredUser {
   /** Zoho zpuid — the task-owner id space. Primary key. */
   zpuid: string;
@@ -29,19 +98,14 @@ export interface StoredUser {
   name: string;
   /** AES-GCM encrypted Zoho refresh token. */
   refreshTokenEnc: string;
-  createdAt: string;
-  updatedAt: string;
 }
 
-/** An MCP client that registered itself via dynamic client registration. */
 export interface StoredClient {
   clientId: string;
   clientName: string;
   redirectUris: string[];
-  createdAt: string;
 }
 
-/** A token we issued to an MCP client, mapping back to a Zoho user. */
 export interface StoredToken {
   token: string;
   zpuid: string;
@@ -51,82 +115,58 @@ export interface StoredToken {
   kind: "access" | "refresh";
 }
 
-interface StoreShape {
-  users: Record<string, StoredUser>;
-  clients: Record<string, StoredClient>;
-  tokens: Record<string, StoredToken>;
+/* ------------------------------- users ------------------------------- */
+
+function toUser(row: any): StoredUser {
+  return {
+    zpuid: row.zpuid,
+    portalUserId: row.portal_user_id,
+    portalId: row.portal_id,
+    email: row.email,
+    name: row.name,
+    refreshTokenEnc: row.refresh_token_enc,
+  };
 }
 
-const empty: StoreShape = { users: {}, clients: {}, tokens: {} };
-
-let data: StoreShape | null = null;
-
-function load(): StoreShape {
-  if (data) return data;
-  try {
-    const raw = fs.readFileSync(STORE_PATH, "utf8");
-    const parsed = JSON.parse(raw) as StoreShape;
-    data = { ...empty, ...parsed };
-    log.info(
-      `store loaded: ${Object.keys(data.users).length} user(s), ` +
-        `${Object.keys(data.clients).length} client(s)`,
-    );
-  } catch {
-    data = structuredClone(empty);
-  }
-  return data;
-}
-
-/** Write via a temp file + rename so a crash cannot truncate the store. */
-function persist(): void {
-  const current = load();
-  try {
-    fs.mkdirSync(path.dirname(STORE_PATH), { recursive: true });
-    const tmp = `${STORE_PATH}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(current, null, 2), "utf8");
-    fs.renameSync(tmp, STORE_PATH);
-  } catch (err) {
-    log.error(`could not persist store to ${STORE_PATH}`, String(err));
-  }
-}
-
-/* ----------------------------- users ----------------------------- */
-
-export function upsertUser(input: {
+export async function upsertUser(input: {
   zpuid: string;
   portalUserId: string;
   portalId: string;
   email: string;
   name: string;
   refreshToken: string;
-}): StoredUser {
-  const store = load();
-  const now = new Date().toISOString();
-  const existing = store.users[input.zpuid];
-
-  const user: StoredUser = {
-    zpuid: input.zpuid,
-    portalUserId: input.portalUserId,
-    portalId: input.portalId,
-    email: input.email,
-    name: input.name,
-    refreshTokenEnc: encrypt(input.refreshToken),
-    createdAt: existing?.createdAt ?? now,
-    updatedAt: now,
-  };
-
-  store.users[input.zpuid] = user;
-  persist();
-  log.info(`stored Zoho connection for ${input.email} (${input.zpuid})`);
-  return user;
+}): Promise<StoredUser> {
+  const { rows } = await db().query(
+    `INSERT INTO users (zpuid, portal_user_id, portal_id, email, name, refresh_token_enc)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT (zpuid) DO UPDATE SET
+       portal_user_id    = EXCLUDED.portal_user_id,
+       portal_id         = EXCLUDED.portal_id,
+       email             = EXCLUDED.email,
+       name              = EXCLUDED.name,
+       refresh_token_enc = EXCLUDED.refresh_token_enc,
+       updated_at        = now()
+     RETURNING *`,
+    [
+      input.zpuid,
+      input.portalUserId,
+      input.portalId,
+      input.email,
+      input.name,
+      encrypt(input.refreshToken),
+    ],
+  );
+  log.info(`stored Zoho connection for ${input.email || input.zpuid}`);
+  return toUser(rows[0]);
 }
 
-export function getUser(zpuid: string): StoredUser | undefined {
-  return load().users[zpuid];
+export async function getUser(zpuid: string): Promise<StoredUser | undefined> {
+  const { rows } = await db().query("SELECT * FROM users WHERE zpuid = $1", [zpuid]);
+  return rows[0] ? toUser(rows[0]) : undefined;
 }
 
-export function getUserRefreshToken(zpuid: string): string | undefined {
-  const user = load().users[zpuid];
+export async function getUserRefreshToken(zpuid: string): Promise<string | undefined> {
+  const user = await getUser(zpuid);
   if (!user) return undefined;
   try {
     return decrypt(user.refreshTokenEnc);
@@ -137,99 +177,99 @@ export function getUserRefreshToken(zpuid: string): string | undefined {
 }
 
 /** Fill in details discovered after sign-in, e.g. the portal user id. */
-export function updateUserDetails(
+export async function updateUserDetails(
   zpuid: string,
-  patch: Partial<Pick<StoredUser, "portalUserId" | "email" | "name">>,
-): void {
-  const store = load();
-  const user = store.users[zpuid];
-  if (!user) return;
-  let changed = false;
-  for (const [k, v] of Object.entries(patch) as [keyof typeof patch, string][]) {
-    if (v && user[k] !== v) {
-      user[k] = v;
-      changed = true;
-    }
-  }
-  if (changed) {
-    user.updatedAt = new Date().toISOString();
-    persist();
-    log.info(`updated stored details for ${user.email || zpuid}`);
-  }
+  patch: { portalUserId?: string; email?: string; name?: string },
+): Promise<void> {
+  await db().query(
+    `UPDATE users SET
+       portal_user_id = COALESCE(NULLIF($2, ''), portal_user_id),
+       email          = COALESCE(NULLIF($3, ''), email),
+       name           = COALESCE(NULLIF($4, ''), name),
+       updated_at     = now()
+     WHERE zpuid = $1`,
+    [zpuid, patch.portalUserId ?? "", patch.email ?? "", patch.name ?? ""],
+  );
 }
 
-export function listUsers(): StoredUser[] {
-  return Object.values(load().users);
+export async function listUsers(): Promise<StoredUser[]> {
+  const { rows } = await db().query("SELECT * FROM users ORDER BY created_at");
+  return rows.map(toUser);
 }
 
 /** Disconnect a user: drops their Zoho token and every token issued to them. */
-export function deleteUser(zpuid: string): boolean {
-  const store = load();
-  const existed = Boolean(store.users[zpuid]);
-  delete store.users[zpuid];
-  for (const [tok, meta] of Object.entries(store.tokens)) {
-    if (meta.zpuid === zpuid) delete store.tokens[tok];
-  }
-  persist();
-  return existed;
+export async function deleteUser(zpuid: string): Promise<boolean> {
+  await db().query("DELETE FROM tokens WHERE zpuid = $1", [zpuid]);
+  const { rowCount } = await db().query("DELETE FROM users WHERE zpuid = $1", [zpuid]);
+  return (rowCount ?? 0) > 0;
 }
 
-/* ---------------------------- clients ---------------------------- */
+/* ------------------------------ clients ------------------------------ */
 
-export function registerClient(clientName: string, redirectUris: string[]): StoredClient {
-  const store = load();
-  const client: StoredClient = {
-    clientId: `mcp_${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`,
-    clientName,
-    redirectUris,
-    createdAt: new Date().toISOString(),
+export async function registerClient(
+  clientName: string,
+  redirectUris: string[],
+): Promise<StoredClient> {
+  const clientId = `mcp_${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
+  await db().query(
+    "INSERT INTO oauth_clients (client_id, client_name, redirect_uris) VALUES ($1, $2, $3)",
+    [clientId, clientName, JSON.stringify(redirectUris)],
+  );
+  return { clientId, clientName, redirectUris };
+}
+
+export async function getClient(clientId: string): Promise<StoredClient | undefined> {
+  const { rows } = await db().query("SELECT * FROM oauth_clients WHERE client_id = $1", [
+    clientId,
+  ]);
+  if (!rows[0]) return undefined;
+  return {
+    clientId: rows[0].client_id,
+    clientName: rows[0].client_name,
+    redirectUris: rows[0].redirect_uris,
   };
-  store.clients[client.clientId] = client;
-  persist();
-  return client;
 }
 
-export function getClient(clientId: string): StoredClient | undefined {
-  return load().clients[clientId];
+/* ------------------------------- tokens ------------------------------ */
+
+export async function saveToken(token: StoredToken): Promise<void> {
+  await db().query(
+    `INSERT INTO tokens (token, zpuid, client_id, kind, expires_at)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (token) DO NOTHING`,
+    [token.token, token.zpuid, token.clientId, token.kind, token.expiresAt],
+  );
 }
 
-/* ----------------------------- tokens ---------------------------- */
+export async function getToken(token: string): Promise<StoredToken | undefined> {
+  const { rows } = await db().query("SELECT * FROM tokens WHERE token = $1", [token]);
+  const row = rows[0];
+  if (!row) return undefined;
 
-export function saveToken(token: StoredToken): void {
-  const store = load();
-  store.tokens[token.token] = token;
-  persist();
-}
+  const found: StoredToken = {
+    token: row.token,
+    zpuid: row.zpuid,
+    clientId: row.client_id,
+    kind: row.kind,
+    expiresAt: Number(row.expires_at),
+  };
 
-export function getToken(token: string): StoredToken | undefined {
-  const found = load().tokens[token];
-  if (!found) return undefined;
   if (found.kind === "access" && found.expiresAt < Date.now()) {
-    revokeToken(token);
+    await revokeToken(token);
     return undefined;
   }
   return found;
 }
 
-export function revokeToken(token: string): void {
-  const store = load();
-  delete store.tokens[token];
-  persist();
+export async function revokeToken(token: string): Promise<void> {
+  await db().query("DELETE FROM tokens WHERE token = $1", [token]);
 }
 
 /** Drop expired access tokens. Called periodically by the HTTP server. */
-export function pruneExpiredTokens(): number {
-  const store = load();
-  const now = Date.now();
-  let removed = 0;
-  for (const [tok, meta] of Object.entries(store.tokens)) {
-    if (meta.kind === "access" && meta.expiresAt < now) {
-      delete store.tokens[tok];
-      removed++;
-    }
-  }
-  if (removed) persist();
-  return removed;
+export async function pruneExpiredTokens(): Promise<number> {
+  const { rowCount } = await db().query(
+    "DELETE FROM tokens WHERE kind = 'access' AND expires_at < $1",
+    [Date.now()],
+  );
+  return rowCount ?? 0;
 }
-
-export const storePath = STORE_PATH;

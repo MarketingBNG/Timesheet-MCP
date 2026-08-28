@@ -12,6 +12,7 @@ import {
   getToken,
   getUser,
   getUserRefreshToken,
+  initStore,
   pruneExpiredTokens,
   updateUserDetails,
 } from "./store.js";
@@ -54,7 +55,7 @@ app.get("/healthz", (_req: Request, res: Response) => {
 
 if (oauthEnabled) {
   app.use(oauthRouter());
-  setInterval(() => pruneExpiredTokens(), 15 * 60 * 1000).unref();
+  setInterval(() => void pruneExpiredTokens(), 15 * 60 * 1000).unref();
 }
 
 /**
@@ -62,7 +63,7 @@ if (oauthEnabled) {
  * is authorised but has no specific user (single-account mode), or throws the
  * 401 itself.
  */
-function authenticate(req: Request, res: Response): UserContext | null | false {
+async function authenticate(req: Request, res: Response): Promise<UserContext | null | false> {
   if (!oauthEnabled) {
     if (AUTH_TOKEN) {
       const bearer = (req.header("authorization") ?? "").replace(/^Bearer\s+/i, "").trim();
@@ -79,7 +80,7 @@ function authenticate(req: Request, res: Response): UserContext | null | false {
   }
 
   const bearer = (req.header("authorization") ?? "").replace(/^Bearer\s+/i, "").trim();
-  const record = bearer ? getToken(bearer) : undefined;
+  const record = bearer ? await getToken(bearer) : undefined;
 
   if (!record || record.kind !== "access") {
     // Point the client at discovery so it knows how to authenticate.
@@ -95,8 +96,8 @@ function authenticate(req: Request, res: Response): UserContext | null | false {
     return false;
   }
 
-  const user = getUser(record.zpuid);
-  const refreshToken = getUserRefreshToken(record.zpuid);
+  const user = await getUser(record.zpuid);
+  const refreshToken = await getUserRefreshToken(record.zpuid);
 
   if (!user || !refreshToken) {
     res.status(401).json({
@@ -131,7 +132,7 @@ async function backfillPortalUserId(ctx: UserContext): Promise<UserContext> {
     const looked = await lookupPortalUser(accessToken, ctx.portalId, ctx.zpuid);
     if (!looked?.portalUserId) return ctx;
 
-    updateUserDetails(ctx.zpuid, {
+    await updateUserDetails(ctx.zpuid, {
       portalUserId: looked.portalUserId,
       email: looked.email,
       name: looked.name,
@@ -145,7 +146,7 @@ async function backfillPortalUserId(ctx: UserContext): Promise<UserContext> {
 }
 
 app.post("/mcp", async (req: Request, res: Response) => {
-  let who = authenticate(req, res);
+  let who = await authenticate(req, res);
   if (who === false) return;
   if (who) who = await backfillPortalUserId(who);
 
@@ -190,23 +191,34 @@ const notAllowed = (_req: Request, res: Response) => {
 app.get("/mcp", notAllowed);
 app.delete("/mcp", notAllowed);
 
-app.listen(PORT, () => {
-  log.info(
-    `zoho-timesheet HTTP server on :${PORT} — ${oauthEnabled ? "OAuth" : "single-account"} mode`,
-  );
-  if (oauthEnabled) {
-    log.info(`public URL: ${publicUrl}`);
-    log.info(`register this redirect URI on the Zoho app: ${publicUrl}/callback`);
-  } else {
-    log.warn(
-      "OAuth is off (set PUBLIC_URL and TOKEN_ENCRYPTION_KEY to enable). " +
-        "All calls will use the single service account.",
+async function boot(): Promise<void> {
+  // Fail fast if the database is unreachable — in OAuth mode nothing works
+  // without it, and a clear error at boot beats a 500 on first sign-in.
+  if (oauthEnabled) await initStore();
+
+  app.listen(PORT, () => {
+    log.info(
+      `zoho-timesheet HTTP server on :${PORT} — ${oauthEnabled ? "OAuth" : "single-account"} mode`,
     );
-    if (!AUTH_TOKEN) {
-      log.warn("MCP_AUTH_TOKEN is not set — /mcp is unauthenticated. Do not deploy like this.");
+    if (oauthEnabled) {
+      log.info(`public URL: ${publicUrl}`);
+      log.info(`register this redirect URI on the Zoho app: ${publicUrl}/callback`);
+    } else {
+      log.warn(
+        "OAuth is off (set PUBLIC_URL and TOKEN_ENCRYPTION_KEY to enable). " +
+          "All calls will use the single service account.",
+      );
+      if (!AUTH_TOKEN) {
+        log.warn("MCP_AUTH_TOKEN is not set — /mcp is unauthenticated. Do not deploy like this.");
+      }
+      getPortalMeta().catch(() => {});
     }
-    getPortalMeta().catch(() => {});
-  }
+  });
+}
+
+boot().catch((err) => {
+  log.error("failed to start", err instanceof Error ? (err.stack ?? err.message) : String(err));
+  process.exit(1);
 });
 
 process.on("unhandledRejection", (reason) => {

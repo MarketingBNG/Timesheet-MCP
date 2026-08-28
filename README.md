@@ -214,13 +214,14 @@ Set these variables on the host:
 | `ZOHO_DOMAIN` | `in` (or your data centre) |
 | `PUBLIC_URL` | the deployed HTTPS URL, no trailing slash |
 | `TOKEN_ENCRYPTION_KEY` | `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` |
-| `STORE_PATH` | a path on a **mounted volume**, e.g. `/data/store.json` |
+| `DATABASE_URL` | Postgres connection string (Neon/Supabase free tier is fine) |
 
 The service-account variables (`ZOHO_REFRESH_TOKEN`, `ZOHO_PORTAL_ID`, `ZOHO_USER_ID`,
 `ZOHO_TIMELOG_OWNER_ID`) are **not needed** in this mode.
 
-> **Use a volume for `STORE_PATH`.** It holds every user's Zoho connection. On an
-> ephemeral filesystem a redeploy wipes it and all 100 people have to reconnect.
+> **User connections live in Postgres**, not on disk, so the service can run on a host
+> with an ephemeral filesystem (Render free tier included) without logging everyone out
+> on redeploy. The schema is created automatically at boot.
 
 > **Keep `TOKEN_ENCRYPTION_KEY` safe and unchanged.** Rotating it makes every stored
 > refresh token undecryptable — same outcome.
@@ -270,13 +271,11 @@ No Node, no files, no tokens to copy. Updates are a redeploy; nobody reinstalls.
   to them.
 - Users who connected before a scope change are repaired on their next request rather
   than being forced to reconnect — see `backfillPortalUserId`.
-- The server is stateless per request, so it scales horizontally — but the JSON store
-  assumes a single writer. Move to Postgres before running more than one instance.
+- The server is stateless per request and the store is Postgres, so it scales
+  horizontally without further work.
 
 ### Honest limitations
 
-- **The JSON store is single-instance.** Fine at ~100 users on one container; it is not
-  safe with multiple replicas writing concurrently.
 - **The portal user id lookup is the one untested leg.** It needs
   `ZohoProjects.users.READ`, which is in the scope list, but could not be exercised
   against the live portal because the development token predates that scope. The code

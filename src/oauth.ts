@@ -192,7 +192,7 @@ export function oauthRouter(): Router {
 
   /* -- dynamic client registration ---------------------------------- */
 
-  router.post("/register", express.json(), (req, res) => {
+  router.post("/register", express.json(), async (req, res) => {
     const redirectUris: string[] = req.body?.redirect_uris ?? [];
     if (!Array.isArray(redirectUris) || redirectUris.length === 0) {
       res.status(400).json({
@@ -202,7 +202,10 @@ export function oauthRouter(): Router {
       return;
     }
 
-    const client = registerClient(String(req.body?.client_name ?? "MCP client"), redirectUris);
+    const client = await registerClient(
+      String(req.body?.client_name ?? "MCP client"),
+      redirectUris,
+    );
     log.info(`registered client "${client.clientName}" (${client.clientId})`);
 
     res.status(201).json({
@@ -217,14 +220,14 @@ export function oauthRouter(): Router {
 
   /* -- authorize: bounce the user to Zoho --------------------------- */
 
-  router.get("/authorize", (req, res) => {
+  router.get("/authorize", async (req, res) => {
     const clientId = String(req.query.client_id ?? "");
     const redirectUri = String(req.query.redirect_uri ?? "");
     const codeChallenge = String(req.query.code_challenge ?? "");
     const method = String(req.query.code_challenge_method ?? "");
     const state = req.query.state ? String(req.query.state) : undefined;
 
-    const client = getClient(clientId);
+    const client = await getClient(clientId);
     if (!client) {
       res.status(400).send("Unknown client_id. Register the client first.");
       return;
@@ -285,7 +288,7 @@ export function oauthRouter(): Router {
         callbackUri(),
       );
       const identity = await resolveZohoIdentity(accessToken);
-      upsertUser({ ...identity, refreshToken });
+      await upsertUser({ ...identity, refreshToken });
 
       const code = randomId(32);
       issuedCodes.set(code, {
@@ -310,17 +313,17 @@ export function oauthRouter(): Router {
 
   /* -- token -------------------------------------------------------- */
 
-  router.post("/token", (req, res) => {
+  router.post("/token", async (req, res) => {
     const grantType = String(req.body?.grant_type ?? "");
 
     if (grantType === "refresh_token") {
       const presented = String(req.body?.refresh_token ?? "");
-      const stored = getToken(presented);
+      const stored = await getToken(presented);
       if (!stored || stored.kind !== "refresh") {
         res.status(400).json({ error: "invalid_grant" });
         return;
       }
-      res.json(issueAccessToken(stored.zpuid, stored.clientId, presented));
+      res.json(await issueAccessToken(stored.zpuid, stored.clientId, presented));
       return;
     }
 
@@ -349,23 +352,23 @@ export function oauthRouter(): Router {
       return;
     }
 
-    res.json(issueAccessToken(record.zpuid, record.clientId));
+    res.json(await issueAccessToken(record.zpuid, record.clientId));
   });
 
   /* -- revoke ------------------------------------------------------- */
 
-  router.post("/revoke", (req, res) => {
+  router.post("/revoke", async (req, res) => {
     const token = String(req.body?.token ?? "");
-    if (token) revokeToken(token);
+    if (token) await revokeToken(token);
     res.status(200).json({});
   });
 
   return router;
 }
 
-function issueAccessToken(zpuid: string, clientId: string, reuseRefresh?: string) {
+async function issueAccessToken(zpuid: string, clientId: string, reuseRefresh?: string) {
   const access = randomId(32);
-  saveToken({
+  await saveToken({
     token: access,
     zpuid,
     clientId,
@@ -376,7 +379,7 @@ function issueAccessToken(zpuid: string, clientId: string, reuseRefresh?: string
   let refresh = reuseRefresh;
   if (!refresh) {
     refresh = randomId(32);
-    saveToken({ token: refresh, zpuid, clientId, kind: "refresh", expiresAt: 0 });
+    await saveToken({ token: refresh, zpuid, clientId, kind: "refresh", expiresAt: 0 });
   }
 
   return {
