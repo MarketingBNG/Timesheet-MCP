@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 import { config } from "./config.js";
-import { currentUser } from "./context.js";
+import { currentUser, effective } from "./context.js";
 import { log } from "./logger.js";
 import { ZohoError } from "./errors.js";
 import { audit } from "./audit.js";
@@ -79,6 +79,27 @@ async function guarded(fn: () => Promise<ToolResult>): Promise<ToolResult> {
   }
 }
 
+/**
+ * Who this server is acting as, rendered for a human.
+ *
+ * Every "nothing to match against" path prints this. An empty task pool looks
+ * identical whether the connection is broken or the caller is simply signed in
+ * as someone who owns no tasks -- and the second is far more likely. Without
+ * the acting identity in the message that is near-impossible to tell apart
+ * from the outside, and the obvious guess (a broken token) is the wrong one.
+ */
+function actingAs(): string {
+  const { label, userId, timelogOwnerId, portalId } = effective();
+  const ids = [
+    userId ? `zpuid ${userId}` : "",
+    timelogOwnerId ? `timelog owner ${timelogOwnerId}` : "",
+    `portal ${portalId}`,
+  ]
+    .filter(Boolean)
+    .join(", ");
+  return `${label} (${ids})`;
+}
+
 function candidateView(c: Scored) {
   return {
     task_id: c.task.task_id,
@@ -117,6 +138,78 @@ export function createServer(): McpServer {
         "passing the exact task_id to log_time. If log_time reports an ambiguous match, " +
         "ask the user which candidate they meant instead of picking one.",
     },
+  );
+
+  /* -------------------------------- whoami ------------------------------- */
+
+  /**
+   * Answers "which Zoho user is this server acting as, and does that user own
+   * anything?" -- the first question to ask when a name match finds nothing,
+   * and previously not answerable by any tool. Never throws: a diagnostic that
+   * fails when things are broken is worthless, so partial answers are returned
+   * with the errors attached.
+   */
+  server.registerTool(
+    "whoami",
+    {
+      title: "Show which Zoho user this server acts as",
+      description:
+        "Report the Zoho identity, portal and task counts this server is operating with. " +
+        "Call this first whenever log_time or get_my_tasks reports that no tasks exist — an " +
+        "empty task list is far more often the wrong account than a missing task.",
+      inputSchema: {},
+    },
+    async () =>
+      guarded(async () => {
+        const eff = effective();
+        const user = currentUser();
+        const problems: string[] = [];
+
+        let portalName = "(unknown)";
+        try {
+          portalName = (await getPortalMeta()).name;
+        } catch (err) {
+          problems.push(`Could not read portal metadata: ${explain(err)}`);
+        }
+
+        let mine: Task[] = [];
+        let counted = false;
+        try {
+          mine = await getTasks({ mineOnly: true, openOnly: false });
+          counted = true;
+        } catch (err) {
+          problems.push(`Could not count assigned tasks: ${explain(err)}`);
+        }
+
+        const openCount = mine.filter((t) => !t.completed).length;
+        const identity = {
+          mode: user ? "signed-in user (OAuth)" : "service account (.env)",
+          email: user?.email || "(not reported)",
+          name: user?.name || "(not reported)",
+          zpuid: eff.userId || "(not set)",
+          timelog_owner_id: eff.timelogOwnerId || "(not set)",
+          portal_id: eff.portalId,
+          portal_name: portalName,
+          can_verify_own_timelogs: callerIsIdentified(),
+          tasks_assigned: counted ? mine.length : "(unavailable)",
+          tasks_open: counted ? openCount : "(unavailable)",
+        };
+
+        const verdict =
+          counted && mine.length === 0
+            ? `\n\nThis user owns NO tasks in portal ${portalName}. Time cannot be logged by ` +
+              `task name until a task is assigned to them — that is a Zoho assignment ` +
+              `question, not a connection fault. Use get_my_tasks with include_others:true ` +
+              `to see whether the work is filed under a colleague instead.`
+            : "";
+
+        return ok(
+          `Acting as ${actingAs()}.` +
+            verdict +
+            (problems.length ? `\n\nProblems:\n- ${problems.join("\n- ")}` : ""),
+          identity,
+        );
+      }),
   );
 
   /* ---------------------------- list_projects ---------------------------- */
@@ -183,14 +276,13 @@ export function createServer(): McpServer {
         });
 
         if (tasks.length === 0) {
-          const who = currentUser();
-        const hint = include_others
-            ? "No tasks matched those filters."
-            : who
-              ? `No open tasks are assigned to ${who.email || who.name} in Zoho. Ask for tasks ` +
-                `to be assigned, create one with create_task, or pass include_others:true.`
-              : "No open tasks are assigned to this user. Try include_others:true, or check " +
-                "that the account this server is configured with is the right one.";
+          const scope = include_completed ? "tasks" : "open tasks";
+          const hint = include_others
+            ? `No tasks matched those filters (searched as ${actingAs()}).`
+            : `No ${scope} are assigned to ${actingAs()}.\n\n` +
+              `Before assuming the task is missing, run whoami to confirm this is the right ` +
+              `Zoho account, and retry with include_others:true — the task often exists but ` +
+              `belongs to a colleague. Otherwise ask for it to be assigned, or use create_task.`;
           return ok(hint, []);
         }
 
@@ -282,12 +374,22 @@ export function createServer(): McpServer {
             );
           }
         } else {
-          const pool = await getTasks({ mineOnly: true, openOnly: true });
+          // Completed tasks stay in the pool. Zoho accepts timelogs against a
+          // closed task, and the usual rhythm is to create a task, close it,
+          // and only then log the day's hours -- so filtering to open tasks
+          // hid exactly the task the caller meant and left no way to reach it
+          // by name.
+          const pool = await getTasks({ mineOnly: true, openOnly: false });
           if (pool.length === 0) {
             audit({ outcome: "refused_no_match", requested });
             return fail(
-              "You have no open tasks to match a name against. Create one with create_task, " +
-                "or ask for a task to be assigned to you in Zoho.",
+              `No Zoho tasks are assigned to ${actingAs()}, so there is nothing to match ` +
+                `"${task_name}" against. Nothing was logged.\n\n` +
+                `An empty task list usually means the wrong account rather than a missing ` +
+                `task. Run whoami to see which Zoho user this server is acting as, and ` +
+                `get_my_tasks with include_others:true to check whether the task exists but ` +
+                `belongs to a colleague. If it genuinely does not exist, create_task will ` +
+                `make one assigned to you.`,
             );
           }
 
@@ -300,15 +402,16 @@ export function createServer(): McpServer {
               candidates: result.candidates.map(candidateView),
             });
             return fail(
-              `No task resembles "${task_name}". Nothing was logged. ` +
-                `Run get_my_tasks to see the available tasks.` +
+              `No task resembles "${task_name}" among the ${pool.length} task(s) assigned to ` +
+                `${actingAs()}. Nothing was logged.` +
                 (result.candidates.length
                   ? `\n\nClosest (all below the matching floor):\n${JSON.stringify(
                       result.candidates.map(candidateView),
                       null,
                       2,
                     )}`
-                  : ""),
+                  : `\n\nNothing came close, which often means the task belongs to someone ` +
+                    `else — get_my_tasks with include_others:true will show it if so.`),
             );
           }
 
@@ -342,6 +445,10 @@ export function createServer(): McpServer {
           hours_hhmm: hoursHHMM,
           bill_status: billStatus,
           notes: notes ?? "",
+          // Surfaced because the pool no longer hides closed tasks: logging
+          // against one is legitimate, but the caller should see that is what
+          // happened rather than discover it in Zoho later.
+          task_completed: task.completed,
         };
 
         if (!task.project_id) {
@@ -395,7 +502,8 @@ export function createServer(): McpServer {
 
           return ok(
             `Logged ${hours}h (${hoursHHMM}) on ${date}.\n` +
-              `Task:    ${task.task_name} [${task.task_id}]\n` +
+              `Task:    ${task.task_name} [${task.task_id}]` +
+              `${task.completed ? " (closed task)" : ""}\n` +
               `Project: ${task.project_name} [${task.project_id}]\n` +
               `Billing: ${billStatus}\n` +
               `Log id:  ${created.log_id || "(not returned by Zoho)"}`,
@@ -1005,11 +1113,15 @@ export function createServer(): McpServer {
           return ok("That export contained no conversations. Nothing to propose.", { drafts: [] });
         }
 
-        const tasks = await getTasks({ mineOnly: !include_others, openOnly: true });
+        // Closed tasks included for the same reason as log_time: a day's work
+        // is routinely logged against a task that was closed the moment it
+        // was done.
+        const tasks = await getTasks({ mineOnly: !include_others, openOnly: false });
         if (tasks.length === 0) {
           return fail(
-            "No open tasks are available to match against, so no drafts could be built. " +
-              "Run get_my_tasks to check the configuration.",
+            `No Zoho tasks are available to match against, so no drafts could be built. ` +
+              `This server is acting as ${actingAs()} — run whoami to confirm that is the ` +
+              `right account, or retry with include_others:true.`,
           );
         }
 
