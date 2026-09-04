@@ -242,6 +242,21 @@ export async function getAttendance(
     });
   }
 
+  // Nothing parsed is almost always a shape mismatch rather than an empty
+  // calendar, and the two are indistinguishable from the outside. Log the
+  // structure -- key names only, never the values, which are HR data.
+  if (byDate.size === 0) {
+    const top = Object.keys(source as Record<string, any>);
+    const firstObj = Object.values(source as Record<string, any>).find(
+      (v) => v && typeof v === "object",
+    );
+    log.warn(
+      `attendance response parsed to nothing for ${subject.label}: ` +
+        `${top.length} top-level key(s) [${top.slice(0, 8).join(", ")}], ` +
+        `inner fields [${firstObj ? Object.keys(firstObj).slice(0, 15).join(", ") : "none"}]`,
+    );
+  }
+
   return {
     subject,
     days: days.map(
