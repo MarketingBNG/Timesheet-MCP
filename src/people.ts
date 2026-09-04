@@ -120,22 +120,50 @@ const employeeCache = new Map<string, Promise<Employee>>();
  * The email to look the employee record up by, or "" when an explicit
  * employee id makes the lookup unnecessary.
  */
-function callerEmail(): string {
-  const email = currentUser()?.email?.trim();
-  if (email) return email;
+async function callerEmail(): Promise<string> {
+  const stored = currentUser()?.email?.trim();
+  if (stored) return stored;
+
+  // An explicit employee id makes the lookup unnecessary.
   if (config.peopleEmployeeId) return "";
+
+  // The stored email is filled in from the Projects side, which needs either
+  // admin rights or at least one owned task — so a new Team Member has none.
+  // Their own token can always answer the question directly, no extra scope
+  // and no task ownership required.
+  const email = await emailFromToken();
+  if (email) return email;
+
   throw new ZohoError(
     "Cannot tell which employee to read attendance for.",
     undefined,
     undefined,
-    "In OAuth mode this comes from the connected account. Running as a service " +
-      "account, set ZOHO_PEOPLE_EMPLOYEE_ID to the employee id whose attendance " +
-      "should be read.",
+    "In OAuth mode this comes from the connected account — try reconnecting. " +
+      "Running as a service account, set ZOHO_PEOPLE_EMPLOYEE_ID to the employee " +
+      "id whose attendance should be read.",
   );
 }
 
-export function resolveEmployee(): Promise<Employee> {
-  const email = callerEmail();
+/** The signed-in user's email, straight from the token that identifies them. */
+async function emailFromToken(): Promise<string> {
+  try {
+    const token = await getAccessToken();
+    const res = await fetch(`${config.accountsBase}/oauth/user/info`, {
+      headers: { Authorization: `Zoho-oauthtoken ${token}` },
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+    if (!res.ok) return "";
+    const json: any = await res.json().catch(() => ({}));
+    return String(json?.Email ?? json?.email ?? "").trim();
+  } catch (err) {
+    // Best effort — the caller has a clearer error to raise than this one.
+    log.warn("could not read the account email from the token", String(err));
+    return "";
+  }
+}
+
+export async function resolveEmployee(): Promise<Employee> {
+  const email = await callerEmail();
 
   // An explicit employee id short-circuits the lookup entirely, which is the
   // only way this works for a service account with no email of its own.
