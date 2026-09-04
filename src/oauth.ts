@@ -434,6 +434,10 @@ export const ZOHO_SCOPES = [
   // Needed to map a zpuid to the portal user id that timelogs are stamped
   // with. Without it, per-user timesheet filtering cannot work.
   "ZohoProjects.users.READ",
+  // Zoho People: check-in / check-out times, and the employee record needed to
+  // map a Projects user onto a People one. Both are read-only.
+  "ZohoPeople.attendance.READ",
+  "ZohoPeople.forms.READ",
 ].join(",");
 
 /** Minimal styled page for the two moments a human sees a browser tab. */

@@ -68,6 +68,13 @@ export const config = {
    */
   timelogOwnerId: optional("ZOHO_TIMELOG_OWNER_ID", ""),
 
+  /**
+   * Zoho People employee id whose attendance is read. Only needed when running
+   * as a service account: in OAuth mode the employee record is found from the
+   * connected user's email instead.
+   */
+  peopleEmployeeId: optional("ZOHO_PEOPLE_EMPLOYEE_ID", ""),
+
   /** Billable | Non Billable — Zoho rejects timelog creation without one. */
   defaultBillStatus: optional("ZOHO_DEFAULT_BILL_STATUS", "Non Billable"),
 

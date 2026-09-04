@@ -10,6 +10,11 @@ Runs two ways: as a **local stdio server** for one person, or as a **deployed HT
 server with per-user OAuth** for a team — same tools either way. See
 [Deploying for a team](#deploying-for-a-team-multi-user-oauth).
 
+**Optional path (Zoho People users only):** `get_attendance`,
+`plan_timesheet_from_attendance` — reads your check-in/check-out times and proposes
+what is missing from the timesheet. Neither tool writes to Zoho. See
+[Filling from attendance](#optional-filling-the-timesheet-from-zoho-people-attendance).
+
 **Optional path (Omi users only):** `import_omi_conversations` — drafts proposed entries
 from an Omi export. It never writes to Zoho. If you do not use Omi, ignore it entirely;
 it needs no extra configuration and the core tools do not depend on it.
@@ -53,7 +58,7 @@ npm run build
 
    **Scope**
    ```
-   ZohoProjects.timesheets.ALL,ZohoProjects.tasks.ALL,ZohoProjects.projects.READ,ZohoProjects.portals.READ,ZohoProjects.users.READ
+   ZohoProjects.timesheets.ALL,ZohoProjects.tasks.ALL,ZohoProjects.projects.READ,ZohoProjects.portals.READ,ZohoProjects.users.READ,ZohoPeople.attendance.READ,ZohoPeople.forms.READ
    ```
 
    **Time Duration**: 10 minutes. **Scope Description**: anything.
@@ -283,6 +288,50 @@ No Node, no files, no tokens to copy. Updates are a redeploy; nobody reinstalls.
   filtering is affected.
 - **Custody.** You are holding 100 people's Zoho refresh tokens. Get the deployment
   reviewed before it goes live.
+
+## Optional: filling the timesheet from Zoho People attendance
+
+Skip this if your organisation does not use Zoho People. Both tools are read-only.
+
+### What it does
+
+`get_attendance` reads your first check-in, last check-out and worked hours for a date
+range. `plan_timesheet_from_attendance` goes further: it subtracts what you have
+already logged in Zoho Projects and reports the shortfall per day, together with your
+task list.
+
+Neither tool writes anything. Attendance knows how long your day was; it cannot know
+what the time was spent on. Splitting a day across tasks on your behalf would put
+invented work into a system of record, so the plan stops at the point where a human
+decision is needed and you are asked which task each day belongs to. You then confirm,
+and `log_time` files it.
+
+Hours come from People's own `TotalHours`, **not** from check-out minus check-in. That
+span includes lunch and every other break, and logging it would overstate most days by
+about an hour.
+
+### Setup
+
+1. Add `ZohoPeople.attendance.READ,ZohoPeople.forms.READ` to the scope list when you
+   generate your token (they are already in the list under [Setup](#setup)). A token
+   minted before these scopes existed keeps working for everything else and fails on
+   these two tools with a message telling you to reconnect.
+2. Nothing else in OAuth mode — your People employee record is found from the email on
+   your connected account.
+3. In single-account mode only, set `ZOHO_PEOPLE_EMPLOYEE_ID`, since a service account
+   has no email to look up.
+
+### Caveats
+
+- **Employee id is a third id space.** People uses an employee record id, which is
+  neither the `zpuid` that owns tasks nor the `600...` id that owns timelogs. Email is
+  the bridge, so a mismatch between your People and Projects emails needs
+  `ZOHO_PEOPLE_EMPLOYEE_ID` set by hand.
+- **Not verified against a live People account.** The Projects side of this server was
+  built against the real portal; the People endpoints and their response shapes come
+  from the documentation. Field-name fallbacks are in place, but expect the first run to
+  need a correction.
+- **On-demand only.** Nothing runs on a schedule. The tools fire when you ask for them.
 
 ## Optional: importing from Omi
 

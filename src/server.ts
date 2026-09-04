@@ -13,6 +13,7 @@ import {
   parseOmiConversations,
   rollUp,
 } from "./omi.js";
+import { getAttendance } from "./people.js";
 import {
   assertIsoDate,
   dateRange,
@@ -1050,6 +1051,128 @@ export function createServer(): McpServer {
             `${counts.skipped ?? 0} skipped as duplicates, ${counts.failed ?? 0} failed.`;
 
         return ok(summary, { wrote_to_zoho: !dry_run && filed > 0, results });
+      }),
+  );
+
+  /* ---------------------------- get_attendance ---------------------------- */
+
+  server.registerTool(
+    "get_attendance",
+    {
+      title: "Get Zoho People check-in / check-out times",
+      description:
+        "Read the signed-in user's attendance from Zoho People over a date range: first " +
+        "check-in, last check-out, and the hours People says were actually worked. " +
+        "Read-only — it never writes a timesheet entry. Use plan_timesheet_from_attendance " +
+        "when the goal is to fill the timesheet from these hours.",
+      inputSchema: {
+        date_from: z.string().describe("Start of the range, inclusive, YYYY-MM-DD."),
+        date_to: z.string().describe("End of the range, inclusive, YYYY-MM-DD."),
+      },
+    },
+    async ({ date_from, date_to }) =>
+      guarded(async () => {
+        const days = dateRange(date_from, date_to);
+        const { employee, days: attendance } = await getAttendance(date_from, date_to, days);
+
+        const worked = attendance.filter((d) => d.hours > 0);
+        const total = worked.reduce((a, d) => a + d.hours, 0);
+
+        return ok(
+          `${employee.name || employee.employeeId}: ${total.toFixed(2)}h of attendance across ` +
+            `${worked.length} of ${days.length} day(s), ${date_from} → ${date_to}.`,
+          { employee_id: employee.employeeId, total_hours: Number(total.toFixed(2)), days: attendance },
+        );
+      }),
+  );
+
+  /* ------------------ plan_timesheet_from_attendance ---------------------- *
+   * Read-only. Attendance says HOW LONG the day was; it cannot say WHAT the
+   * time was spent on, and inventing that split would put fabricated work in
+   * a system of record. So this proposes and stops.
+   * ------------------------------------------------------------------------ */
+
+  server.registerTool(
+    "plan_timesheet_from_attendance",
+    {
+      title: "Plan timesheet entries from attendance",
+      description:
+        "Compare Zoho People attendance against what is already on the Zoho Projects " +
+        "timesheet, and return the shortfall per day alongside the user's tasks. " +
+        "This tool NEVER writes to Zoho.\n\n" +
+        "Attendance knows how long the day was but not what it was spent on, so you MUST " +
+        "ask the user which task each day's hours belong to, then call log_time per day " +
+        "with that task_id. Do not pick a task yourself, and do not file a day whose " +
+        "shortfall is zero.",
+      inputSchema: {
+        date_from: z.string().describe("Start of the range, inclusive, YYYY-MM-DD."),
+        date_to: z.string().describe("End of the range, inclusive, YYYY-MM-DD."),
+      },
+    },
+    async ({ date_from, date_to }) =>
+      guarded(async () => {
+        const days = dateRange(date_from, date_to);
+
+        // Same refusal as get_timesheet_status: without an identity the
+        // "already logged" side would include colleagues' hours, and every
+        // shortfall computed from it would be wrong.
+        if (!callerIsIdentified()) {
+          return fail(
+            `Cannot tell which Zoho user you are, so your logged hours cannot be separated ` +
+              `from everyone else's — no plan is being proposed rather than compute the ` +
+              `shortfall against someone else's timesheet. This resolves once you own at ` +
+              `least one task in Zoho Projects.`,
+          );
+        }
+
+        const [{ employee, days: attendance }, logs, tasks] = await Promise.all([
+          getAttendance(date_from, date_to, days),
+          listTimeLogs({ fromIso: date_from, toIso: date_to }),
+          getTasks({ mineOnly: true, openOnly: false }),
+        ]);
+
+        const loggedByDay = new Map<string, number>(days.map((d) => [d, 0]));
+        for (const l of logs) {
+          if (loggedByDay.has(l.date)) loggedByDay.set(l.date, loggedByDay.get(l.date)! + l.hours);
+        }
+
+        const plan = attendance.map((a) => {
+          const logged = loggedByDay.get(a.date) ?? 0;
+          // Never negative: having logged MORE than attendance is a real
+          // situation (offline work), and it means nothing is owed, not that
+          // hours should be removed.
+          const shortfall = Math.max(0, a.hours - logged);
+          return {
+            date: a.date,
+            check_in: a.checkIn,
+            check_out: a.checkOut,
+            attendance_hours: a.hours,
+            attendance_status: a.status,
+            already_logged_hours: Number(logged.toFixed(2)),
+            hours_to_log: Number(shortfall.toFixed(2)),
+            needs_task: shortfall > 0,
+          };
+        });
+
+        const fillable = plan.filter((d) => d.needs_task);
+        const owed = fillable.reduce((a, d) => a + d.hours_to_log, 0);
+
+        const summary = fillable.length
+          ? `${owed.toFixed(2)}h of attendance is not yet on the timesheet, across ` +
+            `${fillable.length} day(s): ${fillable.map((d) => `${d.date} (${d.hours_to_log}h)`).join(", ")}.\n\n` +
+            `Nothing has been written. Ask the user which task each of these days belongs ` +
+            `to — attendance cannot tell you — then call log_time once per day with the ` +
+            `chosen task_id, the date, and hours_to_log.`
+          : `Attendance for ${date_from} → ${date_to} is already fully reflected on the ` +
+            `timesheet. Nothing to file.`;
+
+        return ok(summary, {
+          wrote_to_zoho: false,
+          employee_id: employee.employeeId,
+          hours_to_log_total: Number(owed.toFixed(2)),
+          per_day: plan,
+          your_tasks: tasks.map(taskView),
+        });
       }),
   );
 
