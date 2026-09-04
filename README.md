@@ -58,7 +58,7 @@ npm run build
 
    **Scope**
    ```
-   ZohoProjects.timesheets.ALL,ZohoProjects.tasks.ALL,ZohoProjects.projects.READ,ZohoProjects.portals.READ,ZohoProjects.users.READ,ZohoPeople.attendance.READ,ZohoPeople.forms.READ
+   ZohoProjects.timesheets.ALL,ZohoProjects.tasks.ALL,ZohoProjects.projects.READ,ZohoProjects.portals.READ,ZohoProjects.users.READ,ZohoPeople.attendance.READ
    ```
 
    **Time Duration**: 10 minutes. **Scope Description**: anything.
@@ -312,25 +312,23 @@ about an hour.
 
 ### Setup
 
-1. Add `ZohoPeople.attendance.READ,ZohoPeople.forms.READ` to the scope list when you
-   generate your token (they are already in the list under [Setup](#setup)). A token
-   minted before these scopes existed keeps working for everything else and fails on
+1. Add `ZohoPeople.attendance.READ` to the scope list when you
+   generate your token (it is already in the list under [Setup](#setup)). A token
+   minted before that scope existed keeps working for everything else and fails on
    these two tools with a message telling you to reconnect.
-2. Nothing else in OAuth mode — your People employee record is found from the email on
-   your connected account.
+2. Nothing else in OAuth mode — attendance is looked up by the email on your
+   connected account.
 3. In single-account mode only, set `ZOHO_PEOPLE_EMPLOYEE_ID`, since a service account
    has no email to look up.
 
 ### Caveats
 
-- **Employee id is a third id space.** People uses an employee record id, which is
-  neither the `zpuid` that owns tasks nor the `600...` id that owns timelogs. Email is
-  the bridge, so a mismatch between your People and Projects emails needs
-  `ZOHO_PEOPLE_EMPLOYEE_ID` set by hand.
-- **Not verified against a live People account.** The Projects side of this server was
-  built against the real portal; the People endpoints and their response shapes come
-  from the documentation. Field-name fallbacks are in place, but expect the first run to
-  need a correction.
+- **Email is the join.** Attendance is requested by email address, so a People account
+  registered under a different email from Projects will not be found; set
+  `ZOHO_PEOPLE_EMPLOYEE_ID` by hand in that case.
+- **Response shapes only partly verified.** The attendance endpoint answers against the
+  live portal, but its per-day field names come from the documentation, with fallbacks
+  in place. Check the first day you read against what People shows you.
 - **On-demand only.** Nothing runs on a schedule. The tools fire when you ask for them.
 
 ## Optional: importing from Omi

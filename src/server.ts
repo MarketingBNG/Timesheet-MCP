@@ -1073,15 +1073,15 @@ export function createServer(): McpServer {
     async ({ date_from, date_to }) =>
       guarded(async () => {
         const days = dateRange(date_from, date_to);
-        const { employee, days: attendance } = await getAttendance(date_from, date_to, days);
+        const { subject, days: attendance } = await getAttendance(date_from, date_to, days);
 
         const worked = attendance.filter((d) => d.hours > 0);
         const total = worked.reduce((a, d) => a + d.hours, 0);
 
         return ok(
-          `${employee.name || employee.employeeId}: ${total.toFixed(2)}h of attendance across ` +
+          `${subject.label}: ${total.toFixed(2)}h of attendance across ` +
             `${worked.length} of ${days.length} day(s), ${date_from} → ${date_to}.`,
-          { employee_id: employee.employeeId, total_hours: Number(total.toFixed(2)), days: attendance },
+          { subject: subject.label, total_hours: Number(total.toFixed(2)), days: attendance },
         );
       }),
   );
@@ -1125,7 +1125,7 @@ export function createServer(): McpServer {
           );
         }
 
-        const [{ employee, days: attendance }, logs, tasks] = await Promise.all([
+        const [{ subject, days: attendance }, logs, tasks] = await Promise.all([
           getAttendance(date_from, date_to, days),
           listTimeLogs({ fromIso: date_from, toIso: date_to }),
           getTasks({ mineOnly: true, openOnly: false }),
@@ -1168,7 +1168,7 @@ export function createServer(): McpServer {
 
         return ok(summary, {
           wrote_to_zoho: false,
-          employee_id: employee.employeeId,
+          subject: subject.label,
           hours_to_log_total: Number(owed.toFixed(2)),
           per_day: plan,
           your_tasks: tasks.map(taskView),

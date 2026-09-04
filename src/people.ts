@@ -103,44 +103,48 @@ async function peopleRequest<T = any>(
  * ------------------------------------------------------------------ */
 
 /**
- * People identifies people by their employee record, which is a THIRD id
- * space — neither the zpuid that owns tasks nor the 600... id that owns
- * timelogs. Email is the only thing the two products reliably share, so that
- * is what we bridge on.
+ * Who attendance is being read for.
+ *
+ * The attendance report accepts an email address directly, so the employee
+ * record — a third id space, neither the zpuid that owns tasks nor the 600...
+ * id that owns timelogs — never has to be looked up. An earlier version did
+ * look it up, and failed against the live portal because the employee form is
+ * not readable the way the docs suggest. Asking by email removes the hop, the
+ * failure, and the extra scope along with it.
  */
-export interface Employee {
-  employeeId: string;
+export interface Subject {
+  /** Set when identifying by email; empty when an explicit id is configured. */
   email: string;
-  name: string;
+  /** Set only from ZOHO_PEOPLE_EMPLOYEE_ID, for a service account. */
+  employeeId: string;
+  label: string;
 }
 
-const employeeCache = new Map<string, Promise<Employee>>();
-
-/**
- * The email to look the employee record up by, or "" when an explicit
- * employee id makes the lookup unnecessary.
- */
-async function callerEmail(): Promise<string> {
+export async function resolveSubject(): Promise<Subject> {
   const stored = currentUser()?.email?.trim();
-  if (stored) return stored;
+  if (stored) return { email: stored, employeeId: "", label: stored };
 
-  // An explicit employee id makes the lookup unnecessary.
-  if (config.peopleEmployeeId) return "";
+  // A service account has no email of its own, so it must be told an id.
+  if (config.peopleEmployeeId) {
+    return {
+      email: "",
+      employeeId: config.peopleEmployeeId,
+      label: `employee ${config.peopleEmployeeId}`,
+    };
+  }
 
   // The stored email is filled in from the Projects side, which needs either
   // admin rights or at least one owned task — so a new Team Member has none.
-  // Their own token can always answer the question directly, no extra scope
-  // and no task ownership required.
+  // Their own token can always answer the question directly.
   const email = await emailFromToken();
-  if (email) return email;
+  if (email) return { email, employeeId: "", label: email };
 
   throw new ZohoError(
-    "Cannot tell which employee to read attendance for.",
+    "Cannot tell whose attendance to read.",
     undefined,
     undefined,
     "In OAuth mode this comes from the connected account — try reconnecting. " +
-      "Running as a service account, set ZOHO_PEOPLE_EMPLOYEE_ID to the employee " +
-      "id whose attendance should be read.",
+      "Running as a service account, set ZOHO_PEOPLE_EMPLOYEE_ID.",
   );
 }
 
@@ -160,84 +164,6 @@ async function emailFromToken(): Promise<string> {
     log.warn("could not read the account email from the token", String(err));
     return "";
   }
-}
-
-export async function resolveEmployee(): Promise<Employee> {
-  const email = await callerEmail();
-
-  // An explicit employee id short-circuits the lookup entirely, which is the
-  // only way this works for a service account with no email of its own.
-  if (!email) {
-    return Promise.resolve({
-      employeeId: config.peopleEmployeeId,
-      email: "",
-      name: `employee ${config.peopleEmployeeId}`,
-    });
-  }
-
-  const cached = employeeCache.get(email);
-  if (cached) return cached;
-
-  const pending = (async () => {
-    const json = await peopleRequest<any>("forms/employee/getRecords", {
-      searchParams: JSON.stringify({
-        searchField: "EMAILID",
-        searchOperator: "Is",
-        searchText: email,
-      }),
-    });
-
-    // People wraps records in nested objects rather than a flat array, and the
-    // shape differs between the getRecords variants, so accept both.
-    const raw = json?.response?.result ?? json?.result ?? [];
-    const records: any[] = Array.isArray(raw) ? raw : Object.values(raw);
-    const flat = records.flatMap((r) =>
-      Array.isArray(r) ? r : r && typeof r === "object" ? Object.values(r).flat() : [],
-    );
-
-    const match = flat.find(
-      (r) => r && typeof r === "object" && !Array.isArray(r),
-    ) as Record<string, any> | undefined;
-
-    if (!match) {
-      throw new ZohoError(
-        `No Zoho People employee record matches ${email}.`,
-        undefined,
-        undefined,
-        "Attendance is read per employee record. If the People account uses a " +
-          "different email from Projects, set ZOHO_PEOPLE_EMPLOYEE_ID explicitly.",
-      );
-    }
-
-    const employeeId = String(
-      match["EmployeeID"] ?? match["Employee ID"] ?? match["employeeId"] ?? "",
-    ).trim();
-
-    if (!employeeId) {
-      throw new ZohoError(
-        `The Zoho People record for ${email} has no employee id.`,
-        undefined,
-        undefined,
-        // The field names, never the values — this is HR data.
-        `Fields present: ${Object.keys(match).slice(0, 12).join(", ")}`,
-      );
-    }
-
-    const first = String(match["FirstName"] ?? "").trim();
-    const last = String(match["LastName"] ?? "").trim();
-
-    return {
-      employeeId,
-      email,
-      name: [first, last].filter(Boolean).join(" ") || email,
-    };
-  })();
-
-  employeeCache.set(email, pending);
-  // A failed lookup must not stay cached, or one transient error becomes
-  // permanent for the life of the process.
-  pending.catch(() => employeeCache.delete(email));
-  return pending;
 }
 
 /* ------------------------------------------------------------------ *
@@ -280,14 +206,15 @@ export async function getAttendance(
   fromIso: string,
   toIso: string,
   days: string[],
-): Promise<{ employee: Employee; days: AttendanceDay[] }> {
+): Promise<{ subject: Subject; days: AttendanceDay[] }> {
   assertIsoDate(fromIso, "date_from");
   assertIsoDate(toIso, "date_to");
 
-  const employee = await resolveEmployee();
+  const subject = await resolveSubject();
 
   const json = await peopleRequest<any>("attendance/getUserReport", {
-    empId: employee.employeeId,
+    emailId: subject.email || undefined,
+    empId: subject.employeeId || undefined,
     sdate: toPortalDate(fromIso, PEOPLE_DATE_FORMAT),
     edate: toPortalDate(toIso, PEOPLE_DATE_FORMAT),
     dateFormat: PEOPLE_DATE_FORMAT,
@@ -316,7 +243,7 @@ export async function getAttendance(
   }
 
   return {
-    employee,
+    subject,
     days: days.map(
       (d) =>
         byDate.get(d) ?? {
