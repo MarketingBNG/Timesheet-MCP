@@ -121,11 +121,15 @@ export interface Subject {
 }
 
 export async function resolveSubject(): Promise<Subject> {
-  const stored = currentUser()?.email?.trim();
+  const signedIn = currentUser();
+  const stored = signedIn?.email?.trim();
   if (stored) return { email: stored, employeeId: "", label: stored };
 
-  // A service account has no email of its own, so it must be told an id.
-  if (config.peopleEmployeeId) {
+  // ZOHO_PEOPLE_EMPLOYEE_ID names ONE person, so it may only ever answer for
+  // the service account. Falling back to it for a signed-in user whose email
+  // we happen not to know would hand them the deployer's attendance under
+  // their own name.
+  if (!signedIn && config.peopleEmployeeId) {
     return {
       email: "",
       employeeId: config.peopleEmployeeId,
@@ -133,18 +137,19 @@ export async function resolveSubject(): Promise<Subject> {
     };
   }
 
-  // The stored email is filled in from the Projects side, which needs either
-  // admin rights or at least one owned task — so a new Team Member has none.
-  // Their own token can always answer the question directly.
+  // A Team Member's email is often unreadable from the Projects side (the
+  // portal user list is admin-only), but their own token always knows it.
   const email = await emailFromToken();
   if (email) return { email, employeeId: "", label: email };
 
   throw new ZohoError(
-    "Cannot tell whose attendance to read.",
+    "Cannot tell whose attendance to read, so none was read.",
     undefined,
     undefined,
-    "In OAuth mode this comes from the connected account — try reconnecting. " +
-      "Running as a service account, set ZOHO_PEOPLE_EMPLOYEE_ID.",
+    signedIn
+      ? "Zoho did not report an email for this connection. Disconnect and reconnect the " +
+        "Timesheet connector; attendance is looked up by email."
+      : "Running as a service account, set ZOHO_PEOPLE_EMPLOYEE_ID.",
   );
 }
 
@@ -206,7 +211,16 @@ export async function getAttendance(
   fromIso: string,
   toIso: string,
   days: string[],
-): Promise<{ subject: Subject; days: AttendanceDay[] }> {
+): Promise<{
+  subject: Subject;
+  days: AttendanceDay[];
+  /**
+   * False when People returned no per-day records at all. That is far more
+   * often an unreadable response (wrong shape, missing scope, unknown email)
+   * than a genuinely empty calendar, and the two must not be reported alike.
+   */
+  available: boolean;
+}> {
   assertIsoDate(fromIso, "date_from");
   assertIsoDate(toIso, "date_to");
 
@@ -259,6 +273,7 @@ export async function getAttendance(
 
   return {
     subject,
+    available: byDate.size > 0,
     days: days.map(
       (d) =>
         byDate.get(d) ?? {

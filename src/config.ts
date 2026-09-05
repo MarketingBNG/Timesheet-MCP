@@ -62,9 +62,10 @@ export const config = {
   accountsBase: `https://accounts.zoho.${domain}`,
 
   /**
-   * Timelogs identify their owner with the portal user id (a 600... value),
-   * which is a DIFFERENT id space from the zpuid used for task owners.
-   * Leave empty to see everyone's logs in get_timesheet_status.
+   * The Zoho user id (a 600... value on this data centre): what timelogs carry
+   * as owner_id, what task owner records carry as `id`, and what
+   * person_responsible takes. A DIFFERENT id space from ZOHO_USER_ID. When
+   * empty it is read from /portals/ login_id on first use.
    */
   timelogOwnerId: optional("ZOHO_TIMELOG_OWNER_ID", ""),
 

@@ -12,7 +12,8 @@
     "watch": "tsc --watch",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
-    "start:http": "node dist/http.js"
+    "start:http": "node dist/http.js",
+    "test": "npm run build && node --test \"test/**/*.test.mjs\""
   },
   "engines": {
     "node": ">=18"
@@ -29,5 +30,10 @@
     "@types/node": "^22.9.0",
     "@types/pg": "^8.23.1",
     "typescript": "^5.6.3"
-  }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    ".env.example"
+  ]
 }

@@ -13,11 +13,15 @@ import {
   getUser,
   getUserRefreshToken,
   initStore,
+  listUserProjects,
   pruneExpiredFlows,
   pruneExpiredTokens,
+  rememberUserProjects,
+  setPortalUserId,
   updateUserDetails,
 } from "./store.js";
-import { getPortalMeta, resolveIdentityFromTasks, takeDiscoveredOwnerId } from "./zoho.js";
+import { REMEMBERED_PROJECT_LIMIT } from "./timesheet.js";
+import { getLoginUserId, getPortalMeta } from "./zoho.js";
 import { getAccessToken } from "./auth.js";
 
 /**
@@ -115,6 +119,7 @@ async function authenticate(req: Request, res: Response): Promise<UserContext | 
   return {
     zpuid: user.zpuid,
     portalUserId: user.portalUserId,
+    portalUserIdSource: user.portalUserIdSource,
     portalId: user.portalId,
     refreshToken,
     email: user.email,
@@ -123,12 +128,14 @@ async function authenticate(req: Request, res: Response): Promise<UserContext | 
 }
 
 /**
- * How long to wait before retrying a resolution that failed. Without this the
- * lookup runs on every single request for a user who cannot be resolved --
- * usually because they own no tasks -- costing two Zoho calls each time.
+ * How long to wait before retrying an identity lookup that failed, so a user
+ * whose /portals/ call errors does not cost an extra Zoho call per request.
  */
 const RESOLVE_RETRY_MS = 30 * 60 * 1000;
 const resolveAttempts = new Map<string, number>();
+
+/** Users whose stored id has been checked against /portals/ login_id in this process. */
+const verifiedThisProcess = new Set<string>();
 
 /** Keep the retry map from growing without bound over a long uptime. */
 function noteAttempt(zpuid: string): void {
@@ -142,67 +149,130 @@ function noteAttempt(zpuid: string): void {
 }
 
 /**
- * Users who own no tasks, or who connected before the users scope was added,
- * have no portal user id, so their timesheet cannot be filtered to just them.
- * Fill it in on first use rather than making them reconnect. Best effort -- a
- * failure here must never block the request.
+ * Make sure the context carries the caller's real Zoho user id.
+ *
+ * The id comes from /portals/ login_id, which is bound to the caller's own
+ * token. It fills in users who connected before this existed, and — once per
+ * process per user — checks an id that is already stored. An earlier version
+ * could learn an id off a task Zoho had assigned to a colleague; a stored id
+ * that disagrees with login_id is exactly that mistake, and is corrected here
+ * with an error in the log rather than left to misfile time.
+ *
+ * Best effort: a failure here must never block the request.
  */
-async function backfillPortalUserId(ctx: UserContext): Promise<UserContext> {
-  if (ctx.portalUserId) return ctx;
+async function establishIdentity(ctx: UserContext): Promise<UserContext> {
+  if (ctx.portalUserId && verifiedThisProcess.has(ctx.zpuid)) return ctx;
 
   const lastTried = resolveAttempts.get(ctx.zpuid) ?? 0;
   if (Date.now() - lastTried < RESOLVE_RETRY_MS) return ctx;
-  noteAttempt(ctx.zpuid);
 
+  const who = ctx.email || ctx.zpuid;
   try {
-    // Preferred: the portal user list. Admin-only — returns 6401 for a
-    // Team Member, which is most people.
-    const accessToken = await runWithUser(ctx, () => getAccessToken());
-    let found = await lookupPortalUser(accessToken, ctx.portalId, ctx.zpuid);
-
-    // Fallback: task owner records, which every user can read and which
-    // carry both id spaces plus the person's email.
-    if (!found?.portalUserId) {
-      const owner = await runWithUser(ctx, () => resolveIdentityFromTasks());
-      if (owner) {
-        found = { portalUserId: owner.portalUserId, email: owner.email, name: owner.name };
-        log.info(`resolved ${ctx.zpuid} from task owner records`);
-      }
-    }
-
-    if (!found?.portalUserId) {
+    const loginId = await runWithUser(ctx, () => getLoginUserId());
+    if (!loginId) {
+      noteAttempt(ctx.zpuid);
       log.warn(
-        `could not resolve a portal user id for ${ctx.zpuid} — they own no tasks. ` +
-          `Timesheet reads stay unfiltered for them; retrying in 30 minutes.`,
+        `/portals/ reported no login_id for ${who}; ` +
+          (ctx.portalUserId
+            ? `keeping stored user id ${ctx.portalUserId} (${ctx.portalUserIdSource || "unverified"})`
+            : `their timesheet cannot be read until it does. Retrying in 30 minutes.`),
       );
       return ctx;
     }
 
-    // Resolved: allow an immediate retry if it is ever cleared again.
+    verifiedThisProcess.add(ctx.zpuid);
     resolveAttempts.delete(ctx.zpuid);
 
-    await updateUserDetails(ctx.zpuid, {
-      portalUserId: found.portalUserId,
-      email: found.email,
-      name: found.name,
-    });
-    log.info(`backfilled portal user id for ${found.email || ctx.zpuid}`);
-    return {
-      ...ctx,
-      portalUserId: found.portalUserId,
-      email: found.email || ctx.email,
-      name: found.name || ctx.name,
-    };
-  } catch (err) {
-    log.warn("portal user id backfill failed", String(err));
+    if (ctx.portalUserId !== loginId) {
+      if (ctx.portalUserId) {
+        log.error(
+          `stored user id ${ctx.portalUserId} (source: ${ctx.portalUserIdSource || "unknown"}) ` +
+            `for ${who} does not match /portals/ login_id ${loginId}; correcting it`,
+        );
+      } else {
+        log.info(`resolved user id ${loginId} for ${who} from /portals/ login_id`);
+      }
+      await setPortalUserId(ctx.zpuid, ctx.portalId, loginId, "login_id");
+      ctx = { ...ctx, portalUserId: loginId, portalUserIdSource: "login_id" };
+    } else if (ctx.portalUserIdSource !== "login_id") {
+      await setPortalUserId(ctx.zpuid, ctx.portalId, loginId, "login_id");
+      ctx = { ...ctx, portalUserIdSource: "login_id" };
+    }
+
+    // Email and name are only cosmetic here, but attendance is looked up by
+    // email, so fill them in when the portal user list is readable.
+    if (!ctx.email || !ctx.name) {
+      const accessToken = await runWithUser(ctx, () => getAccessToken());
+      const looked = await lookupPortalUser(accessToken, ctx.portalId, loginId);
+      if (looked) {
+        await updateUserDetails(ctx.zpuid, { email: looked.email, name: looked.name });
+        ctx = { ...ctx, email: ctx.email || looked.email, name: ctx.name || looked.name };
+      }
+    }
     return ctx;
+  } catch (err) {
+    noteAttempt(ctx.zpuid);
+    log.warn(`identity check failed for ${who}`, String(err));
+    return ctx;
+  }
+}
+
+/**
+ * After a request, persist what it revealed about the caller — from the SAME
+ * context object the request ran in, so nothing can be filed under another
+ * user who happened to finish at the same time.
+ */
+async function persistDiscoveries(who: UserContext, storedIdBefore: string): Promise<void> {
+  const d = who.discovered;
+  if (!d) return;
+
+  if (d.ownerId && d.ownerIdSource && d.ownerId !== storedIdBefore) {
+    try {
+      await setPortalUserId(who.zpuid, who.portalId, d.ownerId, d.ownerIdSource);
+      // Only an id that came from the caller's own token (/portals/ login_id)
+      // is trusted enough to stop re-checking. One read off a Zoho write
+      // response stays open to correction on the next request.
+      if (d.ownerIdSource === "login_id") verifiedThisProcess.add(who.zpuid);
+      log.info(`persisted user id ${d.ownerId} (${d.ownerIdSource}) for ${who.email || who.zpuid}`);
+    } catch (err) {
+      log.warn("could not persist the caller's user id", String(err));
+    }
+  }
+
+  if (d.projects.size > 0) {
+    // Every project written to, not only the ones we did not already know:
+    // the upsert also bumps last_written_at, and the read side keeps the most
+    // recently written. Skipping known ones froze their timestamp, so the
+    // project someone logs to every day would eventually age out of the window
+    // and its hours would stop being found.
+    const written = [...d.projects].map(([project_id, project_name]) => ({
+      project_id,
+      project_name,
+    }));
+    try {
+      await rememberUserProjects(who.zpuid, who.portalId, written);
+    } catch (err) {
+      log.warn("could not persist written projects", String(err));
+    }
   }
 }
 
 app.post("/mcp", async (req: Request, res: Response) => {
   let who = await authenticate(req, res);
   if (who === false) return;
-  if (who) who = await backfillPortalUserId(who);
+
+  if (who) {
+    who = await establishIdentity(who);
+    try {
+      who.rememberedProjects = await listUserProjects(
+        who.zpuid,
+        who.portalId,
+        REMEMBERED_PROJECT_LIMIT,
+      );
+    } catch (err) {
+      log.warn("could not load remembered projects", String(err));
+    }
+  }
 
   const server = createServer();
   const transport = new StreamableHTTPServerTransport({
@@ -221,18 +291,9 @@ app.post("/mcp", async (req: Request, res: Response) => {
   };
 
   try {
+    const storedIdBefore = who?.portalUserId ?? "";
     await (who ? runWithUser(who, handle) : handle());
-
-    // A write may have revealed the caller's portal user id. Persist it so
-    // the next request can filter their timesheet to just them.
-    if (who && !who.portalUserId) {
-      const discovered = takeDiscoveredOwnerId();
-      if (discovered) {
-        await updateUserDetails(who.zpuid, { portalUserId: discovered });
-        resolveAttempts.delete(who.zpuid);
-        log.info(`persisted portal user id ${discovered} for ${who.email || who.zpuid}`);
-      }
-    }
+    if (who) await persistDiscoveries(who, storedIdBefore);
   } catch (err) {
     log.error("request failed", err instanceof Error ? err.stack : String(err));
     if (!res.headersSent) {
@@ -268,6 +329,12 @@ async function boot(): Promise<void> {
     if (oauthEnabled) {
       log.info(`public URL: ${publicUrl}`);
       log.info(`register this redirect URI on the Zoho app: ${publicUrl}/callback`);
+      if (!config.portalId) {
+        log.warn(
+          "ZOHO_PORTAL_ID is not set: a user who belongs to several Zoho portals is bound " +
+            "to whichever Zoho lists first. Set it to pin the company portal.",
+        );
+      }
     } else {
       log.warn(
         "OAuth is off (set PUBLIC_URL and TOKEN_ENCRYPTION_KEY to enable). " +

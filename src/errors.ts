@@ -40,7 +40,9 @@ export function describeZohoError(status: number, body: string): ZohoError {
   const base = message ?? body.slice(0, 400) ?? "Unknown Zoho error";
 
   const hints: Record<string, string> = {
-    "6401": "The task or project id does not exist in this portal, or the service account cannot see it.",
+    "6401":
+      "Zoho's generic bad-request code: the id may not exist in this portal, the account may " +
+      "not be able to see it, or a user id passed is not a member of the project.",
     "6501": "This portal id is not valid for the authenticated account. Check ZOHO_PORTAL_ID.",
     "6831": "The timelog payload was rejected. Check hours format (HH:MM), date format, and bill_status.",
     "6834": "Logging time on this task is not permitted — the task may be closed, or timesheet entry is restricted for this user.",

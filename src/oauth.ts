@@ -67,16 +67,20 @@ const callbackUri = () => `${publicUrl}/callback`;
  * ------------------------------------------------------------------ */
 
 /**
- * Map a zpuid to the portal user id (600...) that timelogs are stamped with.
- * Requires ZohoProjects.users.READ; returns null when the scope is absent so
- * a token issued before that scope was added still works, just without
- * per-user timesheet filtering.
+ * Enrich a known user id with the email and name from the portal user list.
+ * Requires ZohoProjects.users.READ and, on most portals, an admin role — for
+ * a Team Member it returns null and nothing else depends on it.
+ *
+ * Matches on the Zoho user id (the `id` field, 600...), never on a zpuid: the
+ * login zpuid from /portals/ is not the zpuid that user and owner records
+ * carry, so a zpuid match would either fail or, worse, hit someone else.
  */
 export async function lookupPortalUser(
   accessToken: string,
   portalId: string,
-  zpuid: string,
+  userId: string,
 ): Promise<{ portalUserId: string; email: string; name: string } | null> {
+  if (!userId) return null;
   try {
     const res = await fetch(`${config.apiBase}/portal/${portalId}/users/`, {
       headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
@@ -89,16 +93,14 @@ export async function lookupPortalUser(
     }
 
     const users: any[] = json.users ?? [];
-    // The id field names vary between portals, so try each known spelling
-    // before giving up.
     const match = users.find((u) =>
-      [u.zpuid, u.id, u.user_id, u.zuid].some((v) => String(v ?? "") === String(zpuid)),
+      [u.id, u.user_id, u.zuid].some((v) => String(v ?? "") === String(userId)),
     );
 
     if (!match) {
       // Log the shape, never the contents — this is other people's data.
       log.warn(
-        `zpuid ${zpuid} not in the portal user list (${users.length} entries; ` +
+        `user id ${userId} not in the portal user list (${users.length} entries; ` +
           `fields: ${users[0] ? Object.keys(users[0]).join(",") : "none"})`,
       );
       return null;
@@ -116,12 +118,20 @@ export async function lookupPortalUser(
 }
 
 /**
- * Resolve who just authorized us: their zpuid from the portal, and their
- * portal user id from the user list.
+ * Resolve who just authorized us.
+ *
+ * GET /portals/ returns, at the top level, the caller's own `login_id`: the
+ * Zoho user id (600... here) that Zoho stamps on timelogs, puts on task owner
+ * records and accepts as person_responsible. It is bound to the token, needs
+ * no extra scope, and is available to every Team Member — which makes it the
+ * one identity source that cannot be confused with a colleague's. The
+ * `login_zpuid` in each portal entry is our primary key for the user, but it
+ * is NOT the zpuid that owner records carry, so it is never compared to them.
  */
-async function resolveZohoIdentity(accessToken: string): Promise<{
+export async function resolveZohoIdentity(accessToken: string): Promise<{
   zpuid: string;
   portalUserId: string;
+  portalUserIdSource: string;
   portalId: string;
   email: string;
   name: string;
@@ -139,22 +149,42 @@ async function resolveZohoIdentity(accessToken: string): Promise<{
   const portal =
     portals.find((p) => String(p.id_string ?? p.id) === String(config.portalId)) ?? portals[0];
 
-  const zpuid = String(portal.login_zpuid ?? "");
+  if (!config.portalId && portals.length > 1) {
+    log.warn(
+      `this account belongs to ${portals.length} portals and ZOHO_PORTAL_ID is unset; ` +
+        `binding to "${portal.name ?? portal.id}"`,
+    );
+  }
+
+  const zpuid = String(portal.login_zpuid ?? json.login_zpuid ?? "");
   if (!zpuid) throw new Error("Zoho did not report a user id for this account.");
 
-  // The signed-in user appears in the portal's own profile block.
-  const profile = portal.profile_details ?? {};
-  const owner = portal.portal_owner ?? {};
-  const isOwner = String(owner.zpuid ?? "") === zpuid;
   const portalId = String(portal.id_string ?? portal.id);
+  const loginId = String(json.login_id ?? "").trim();
+  const owner = portal.portal_owner ?? {};
+  const profile = portal.profile_details ?? {};
 
-  // Authoritative: the portal user list carries the 600... id for everyone.
-  const looked = await lookupPortalUser(accessToken, portalId, zpuid);
+  let portalUserId = /^\d{4,}$/.test(loginId) ? loginId : "";
+  let source = portalUserId ? "login_id" : "";
+
+  // The portal owner block is the one place a non-admin can read a user id
+  // from; it only helps if the caller IS the owner.
+  const ownerId = String(owner.id ?? "");
+  if (!portalUserId && ownerId && String(owner.zpuid ?? "") === zpuid) {
+    portalUserId = ownerId;
+    source = "portal_owner";
+  }
+
+  // Email and name: the user list if we may read it, else whatever the portal
+  // says about the caller.
+  const looked = await lookupPortalUser(accessToken, portalId, portalUserId);
+  const isOwner = portalUserId !== "" && portalUserId === ownerId;
 
   return {
     zpuid,
     portalId,
-    portalUserId: looked?.portalUserId || (isOwner ? String(owner.id ?? "") : ""),
+    portalUserId,
+    portalUserIdSource: source,
     email: looked?.email || String(isOwner ? owner.email : (profile.email ?? "")) || "",
     name:
       looked?.name || String(isOwner ? owner.first_name : (profile.name ?? "")) || "Zoho user",
@@ -431,8 +461,8 @@ export const ZOHO_SCOPES = [
   "ZohoProjects.tasks.ALL",
   "ZohoProjects.projects.READ",
   "ZohoProjects.portals.READ",
-  // Needed to map a zpuid to the portal user id that timelogs are stamped
-  // with. Without it, per-user timesheet filtering cannot work.
+  // Lets an admin's connection read the portal user list for email and name.
+  // Identity itself comes from /portals/ login_id, which needs no extra scope.
   "ZohoProjects.users.READ",
   // Zoho People check-in / check-out times. Read-only, and the only People
   // scope needed: the attendance report takes an email address, so no

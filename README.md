@@ -61,6 +61,10 @@ npm run build
    ZohoProjects.timesheets.ALL,ZohoProjects.tasks.ALL,ZohoProjects.projects.READ,ZohoProjects.portals.READ,ZohoProjects.users.READ,ZohoPeople.attendance.READ
    ```
 
+   Your own Zoho user id comes from `GET /restapi/portals/` (`login_id`), which needs no
+   scope beyond `portals.READ`, so an existing connection keeps working. `users.READ` is
+   only used to read your name and email, and is admin-only on most portals.
+
    **Time Duration**: 10 minutes. **Scope Description**: anything.
 
 4. Click **Create**, pick your portal, and copy the generated **code**. It expires in
@@ -100,7 +104,18 @@ curl -H "Authorization: Zoho-oauthtoken ACCESS_TOKEN" \
   "https://projects.zoho.com/restapi/portal/PORTAL_ID/users/"
 ```
 
-Find the entry with your email; its `id` (the zpuid) → `ZOHO_USER_ID`.
+Find the entry with your email. Two different ids matter, and mixing them up is the
+single most common way to misconfigure this server:
+
+| Value | What it is | Goes in |
+| --- | --- | --- |
+| `zpuid` (a long `2839...` number) | The portal-login id. Used only as this server's key for you. | `ZOHO_USER_ID` |
+| `id` (a shorter `600...` number, the Zoho user id / ZUID) | What Zoho stamps on your timelogs as `owner_id`, what task owner records carry as `id`, and what `person_responsible` takes when assigning a task. | `ZOHO_TIMELOG_OWNER_ID` |
+
+They are **not** interchangeable, and the zpuid on a task owner record is not the same
+number as your login zpuid either — never compare them. If you leave
+`ZOHO_TIMELOG_OWNER_ID` unset the server reads it from `GET /restapi/portals/`
+(`login_id`) on first use, which is also how it works in OAuth mode.
 
 ### 4. Configure
 
@@ -412,7 +427,10 @@ and then files only what you approve.
 | `invalid_client` on startup | Client id/secret belong to a different data centre than `ZOHO_DOMAIN`. |
 | `invalid_grant` / `invalid_code` | Refresh token revoked, or the grant code was already exchanged. Generate a new one. |
 | 401 on every call, refresh works | `ZOHO_DOMAIN` mismatch — the token is DC-bound. |
-| `get_my_tasks` returns nothing | `ZOHO_USER_ID` is not the zpuid, or you have no open tasks. Try `include_others: true` to confirm the portal is reachable. |
+| `get_my_tasks` returns nothing | Most often the tasks exist but are not assigned to you. Run `whoami`, then `get_my_tasks` with `include_others: true` **and** `project_name` (a large portal needs the project name), and `update_task` with `assign_to_me: true` on any that are yours. |
+| `get_timesheet_status` says `undetermined` | It could not read anything, and says so rather than reporting 0h. Either the Zoho user id is unknown, or you own no tasks and the connector has never written for you, so there is no project to look in. Pass `project_name`. |
+| `get_timesheet_status` shows `days_unknown` | Some project-months could not be read (a throttle, a permission error, or the request budget). Those days are **not** empty — check `coverage.scan_errors`. |
+| A task created via `create_task` does not appear in `get_my_tasks` | Zoho did not assign it to you; the tool now says so in its result. Use `update_task` with `assign_to_me: true`, or ask an admin to add you to the project. |
 | Timelog rejected with code 6834 | Task is closed, or timesheet entry is restricted for this user on that project. |
 | Dates land one day off | Portal date format is not one this server could parse; it fell back to `MM-dd-yyyy`. Check the startup line on stderr. |
 
@@ -421,8 +439,26 @@ and then files only what you approve.
 - **Timesheet approval workflows are not handled.** If your portal requires timesheets
   to be submitted and approved, entries created here land as unsubmitted logs; you still
   submit them in the UI. A `submit_timesheet` tool would be the next thing to add.
-- **Single service account.** Every entry is attributed to `ZOHO_USER_ID`. This is not
-  multi-user; pointing two people at one instance would misattribute their time.
+- **Single service account** in stdio mode. Every entry is attributed to the account in
+  `.env`; pointing two people at one stdio instance would misattribute their time. Deploy
+  the HTTP server in OAuth mode for a team.
+- **The timesheet read is a sweep, not a query.** Zoho serves timelogs per project, never
+  "everything this person logged", so a read has to choose projects: the ones holding your
+  own tasks, the ones this connector has written to for you, and — only when the portal is
+  small enough to afford it — every active project. On a portal with hundreds of projects
+  the read is therefore a **lower bound**, and it says so:
+
+  | Field | Meaning |
+  | --- | --- |
+  | `total_hours_found` | Hours actually found. A total only when `is_complete` is true. |
+  | `is_complete` / `coverage.covers_whole_timesheet` | Every visible project, every month, every log type, nothing failed. Only then does "no hours" mean "none logged". |
+  | `coverage.incomplete_because` | Plain-language list of what was not read. |
+  | `days_missing` | Days **confirmed** to have no time. Empty unless the read was complete. |
+  | `days_unknown` | Days where no time was found but that could not be confirmed. Never treat these as free. |
+
+  `plan_timesheet_from_attendance` mirrors this: `already_logged_is_complete` and the
+  per-day `safe_to_file_without_asking` say whether a shortfall is a fact or a maximum.
+  Pass `project_name` to scope a read to the project you care about.
 - **No `update_time_log`.** Delete and re-log instead.
 - Time is only logged against **tasks**, not bugs/issues or general logs.
 - The Omi importer is **read-only by construction** — it has no code path to Zoho writes.

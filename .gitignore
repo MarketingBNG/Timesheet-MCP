@@ -7,3 +7,4 @@ data/
 *.tmp
 *.tmp.*
 deploy-env.txt
+test/tmp-audit.jsonl

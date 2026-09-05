@@ -58,6 +58,10 @@ export async function initStore(): Promise<void> {
       updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
     );
 
+    -- Where portal_user_id came from. Rows written before this column existed
+    -- read '' and are re-verified against /portals/ login_id on next use.
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS portal_user_id_source TEXT NOT NULL DEFAULT '';
+
     CREATE TABLE IF NOT EXISTS oauth_clients (
       client_id     TEXT PRIMARY KEY,
       client_name   TEXT NOT NULL,
@@ -86,6 +90,18 @@ export async function initStore(): Promise<void> {
       expires_at BIGINT NOT NULL,
       PRIMARY KEY (kind, key)
     );
+
+    -- Projects each user has written to through this server. Zoho only serves
+    -- timelogs per project, so this is how a timesheet read knows where to
+    -- look for a person who owns no tasks in the project they logged against.
+    CREATE TABLE IF NOT EXISTS user_projects (
+      zpuid           TEXT NOT NULL,
+      portal_id       TEXT NOT NULL,
+      project_id      TEXT NOT NULL,
+      project_name    TEXT NOT NULL DEFAULT '',
+      last_written_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (zpuid, portal_id, project_id)
+    );
   `);
 
   const { rows } = await db().query<{ count: string }>("SELECT count(*) FROM users");
@@ -100,10 +116,12 @@ export async function closeStore(): Promise<void> {
 /* ------------------------------- types ------------------------------- */
 
 export interface StoredUser {
-  /** Zoho zpuid — the task-owner id space. Primary key. */
+  /** Zoho login zpuid — our primary key. Not the zpuid on task owner records. */
   zpuid: string;
-  /** Portal user id (600...) — the timelog-owner id space. */
+  /** Zoho user id (600...) — what timelogs and task owner records carry. */
   portalUserId: string;
+  /** login_id | timelog_write | users_endpoint | portal_owner | '' (unverified legacy) */
+  portalUserIdSource: string;
   portalId: string;
   email: string;
   name: string;
@@ -132,6 +150,7 @@ function toUser(row: any): StoredUser {
   return {
     zpuid: row.zpuid,
     portalUserId: row.portal_user_id,
+    portalUserIdSource: row.portal_user_id_source ?? "",
     portalId: row.portal_id,
     email: row.email,
     name: row.name,
@@ -142,25 +161,33 @@ function toUser(row: any): StoredUser {
 export async function upsertUser(input: {
   zpuid: string;
   portalUserId: string;
+  portalUserIdSource: string;
   portalId: string;
   email: string;
   name: string;
   refreshToken: string;
 }): Promise<StoredUser> {
   const { rows } = await db().query(
-    `INSERT INTO users (zpuid, portal_user_id, portal_id, email, name, refresh_token_enc)
-     VALUES ($1, $2, $3, $4, $5, $6)
+    `INSERT INTO users (zpuid, portal_user_id, portal_user_id_source, portal_id, email, name, refresh_token_enc)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
      ON CONFLICT (zpuid) DO UPDATE SET
-       portal_user_id    = EXCLUDED.portal_user_id,
-       portal_id         = EXCLUDED.portal_id,
-       email             = EXCLUDED.email,
-       name              = EXCLUDED.name,
-       refresh_token_enc = EXCLUDED.refresh_token_enc,
-       updated_at        = now()
+       -- Never erase a known user id: a reconnect during a moment when Zoho
+       -- omits login_id would otherwise blank it and lock the account out of
+       -- its own timesheet.
+       portal_user_id        = COALESCE(NULLIF(EXCLUDED.portal_user_id, ''), users.portal_user_id),
+       portal_user_id_source = COALESCE(
+                                 NULLIF(EXCLUDED.portal_user_id_source, ''),
+                                 users.portal_user_id_source),
+       portal_id             = EXCLUDED.portal_id,
+       email                 = COALESCE(NULLIF(EXCLUDED.email, ''), users.email),
+       name                  = COALESCE(NULLIF(EXCLUDED.name, ''), users.name),
+       refresh_token_enc     = EXCLUDED.refresh_token_enc,
+       updated_at            = now()
      RETURNING *`,
     [
       input.zpuid,
       input.portalUserId,
+      input.portalUserIdSource,
       input.portalId,
       input.email,
       input.name,
@@ -187,20 +214,66 @@ export async function getUserRefreshToken(zpuid: string): Promise<string | undef
   }
 }
 
-/** Fill in details discovered after sign-in, e.g. the portal user id. */
+/** Fill in details discovered after sign-in. Empty strings leave a field unchanged. */
 export async function updateUserDetails(
   zpuid: string,
-  patch: { portalUserId?: string; email?: string; name?: string },
+  patch: { email?: string; name?: string },
 ): Promise<void> {
   await db().query(
     `UPDATE users SET
-       portal_user_id = COALESCE(NULLIF($2, ''), portal_user_id),
-       email          = COALESCE(NULLIF($3, ''), email),
-       name           = COALESCE(NULLIF($4, ''), name),
-       updated_at     = now()
+       email      = COALESCE(NULLIF($2, ''), email),
+       name       = COALESCE(NULLIF($3, ''), name),
+       updated_at = now()
      WHERE zpuid = $1`,
-    [zpuid, patch.portalUserId ?? "", patch.email ?? "", patch.name ?? ""],
+    [zpuid, patch.email ?? "", patch.name ?? ""],
   );
+}
+
+/**
+ * Record which Zoho user a connected account is.
+ *
+ * One person has one user id, so if another row in the same portal already
+ * holds this id it was learned wrongly (an earlier version could pick it up
+ * from a task Zoho had assigned to someone else). That row is cleared so it
+ * re-resolves from its own token on its next request, and the clash is logged
+ * — silently letting two accounts share an identity is how one user ends up
+ * editing another's timesheet.
+ */
+export async function setPortalUserId(
+  zpuid: string,
+  portalId: string,
+  portalUserId: string,
+  source: string,
+): Promise<void> {
+  if (!portalUserId) return;
+  const client = await db().connect();
+  try {
+    await client.query("BEGIN");
+    const cleared = await client.query(
+      `UPDATE users SET portal_user_id = '', portal_user_id_source = 'cleared_conflict',
+                        updated_at = now()
+       WHERE portal_id = $1 AND portal_user_id = $2 AND zpuid <> $3
+       RETURNING zpuid, email`,
+      [portalId, portalUserId, zpuid],
+    );
+    for (const row of cleared.rows) {
+      log.error(
+        `user id ${portalUserId} was also stored for ${row.email || row.zpuid}; cleared it ` +
+          `there — that account will re-identify from its own token on its next request`,
+      );
+    }
+    await client.query(
+      `UPDATE users SET portal_user_id = $2, portal_user_id_source = $3, updated_at = now()
+       WHERE zpuid = $1`,
+      [zpuid, portalUserId, source],
+    );
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 export async function listUsers(): Promise<StoredUser[]> {
@@ -211,8 +284,49 @@ export async function listUsers(): Promise<StoredUser[]> {
 /** Disconnect a user: drops their Zoho token and every token issued to them. */
 export async function deleteUser(zpuid: string): Promise<boolean> {
   await db().query("DELETE FROM tokens WHERE zpuid = $1", [zpuid]);
+  await db().query("DELETE FROM user_projects WHERE zpuid = $1", [zpuid]);
   const { rowCount } = await db().query("DELETE FROM users WHERE zpuid = $1", [zpuid]);
   return (rowCount ?? 0) > 0;
+}
+
+/* --------------------------- user projects --------------------------- */
+
+export interface StoredProject {
+  project_id: string;
+  project_name: string;
+}
+
+export async function rememberUserProjects(
+  zpuid: string,
+  portalId: string,
+  projects: StoredProject[],
+): Promise<void> {
+  for (const p of projects) {
+    if (!p.project_id) continue;
+    await db().query(
+      `INSERT INTO user_projects (zpuid, portal_id, project_id, project_name)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (zpuid, portal_id, project_id) DO UPDATE SET
+         project_name    = COALESCE(NULLIF(EXCLUDED.project_name, ''), user_projects.project_name),
+         last_written_at = now()`,
+      [zpuid, portalId, p.project_id, p.project_name ?? ""],
+    );
+  }
+}
+
+export async function listUserProjects(
+  zpuid: string,
+  portalId: string,
+  limit = 50,
+): Promise<StoredProject[]> {
+  const { rows } = await db().query(
+    `SELECT project_id, project_name FROM user_projects
+     WHERE zpuid = $1 AND portal_id = $2
+     ORDER BY last_written_at DESC
+     LIMIT $3`,
+    [zpuid, portalId, limit],
+  );
+  return rows.map((r) => ({ project_id: r.project_id, project_name: r.project_name }));
 }
 
 /* ------------------------------ clients ------------------------------ */
